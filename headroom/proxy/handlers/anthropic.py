@@ -25,6 +25,8 @@ import httpx
 
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.backend_decision import apply_selfhosted_model
+from headroom.proxy.backend_decision import decide as decide_backend
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
@@ -1659,8 +1661,13 @@ class AnthropicHandlerMixin:
                 except (json.JSONDecodeError, ValueError):
                     body_mutation_tracker.mark_mutated("original_unparseable")
 
-            # Forward request - use Bedrock backend if configured, otherwise direct API
-            if self.anthropic_backend is not None:
+            # Forward request - route to the self-hosted/company backend (if
+            # configured / selected), otherwise fall through to the native
+            # Anthropic passthrough (frontier). See proxy/backend_decision.py.
+            _route = decide_backend(self.config, self.anthropic_backend, body)
+            if _route.use_selfhosted and _route.routing_enabled:
+                apply_selfhosted_model(self.config, body)
+            if _route.use_selfhosted:
                 # Route through Bedrock backend
                 try:
                     if stream:

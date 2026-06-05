@@ -103,6 +103,23 @@ class ProxyConfig:
     bedrock_profile: str | None = None
     anyllm_provider: str = "openai"
 
+    # Capability-aware backend routing (local/company capable model <-> frontier).
+    # When ``routing_enabled`` is True, the configured ``backend`` is treated as
+    # the "self-hosted" tier (a company-provided or LAN-hosted capable model) and
+    # each request is routed per-request between it and the native frontier
+    # (Anthropic) passthrough — which keeps Headroom's prompt-caching/prefix-freeze
+    # optimizations on frontier traffic. When False, behavior is unchanged: the
+    # configured backend (if any) handles every request. See
+    # docs/design/local-frontier-routing.md.
+    routing_enabled: bool = False
+    # Default tier when routing is enabled and no stronger signal applies.
+    routing_prefer: Literal["selfhosted", "frontier"] = "selfhosted"
+    # Self-hosted/company endpoint connection (URL + key + model). For a raw LAN
+    # Ollama box, set api_base to the LAN URL and leave api_key empty.
+    routing_selfhosted_api_base: str | None = None
+    routing_selfhosted_api_key: str | None = None
+    routing_selfhosted_model: str | None = None
+
     # Optimization mode: "token" (rewrite for max compression) or
     # "cache" (freeze prior turns for prefix-cache stability).
     mode: str = "token"

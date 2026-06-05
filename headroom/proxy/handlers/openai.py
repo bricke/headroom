@@ -44,6 +44,8 @@ import httpx
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.backend_decision import apply_selfhosted_model
+from headroom.proxy.backend_decision import decide as decide_backend
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import _summarize_transforms
 from headroom.proxy.outcome import RequestOutcome
@@ -1923,8 +1925,12 @@ class OpenAIHandlerMixin:
         optimized_tokens = tokenizer.count_messages(body["messages"])
         tokens_saved = original_tokens - optimized_tokens
 
-        # Route through LiteLLM/any-llm backend if configured
-        if self.anthropic_backend is not None:
+        # Route through the self-hosted/company backend (if configured / selected),
+        # otherwise fall through to the native passthrough (frontier).
+        _route = decide_backend(self.config, self.anthropic_backend, body)
+        if _route.use_selfhosted and _route.routing_enabled:
+            apply_selfhosted_model(self.config, body)
+        if _route.use_selfhosted:
             try:
                 if stream:
                     self.pipeline_extensions.emit(

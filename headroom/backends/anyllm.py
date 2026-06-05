@@ -44,8 +44,14 @@ class AnyLLMBackend(Backend):
         self.api_key = api_key
         self.api_base = api_base
 
-        # Create the AnyLLM instance once and reuse
-        self.llm = AnyLLM.create(self.provider)
+        # Create the AnyLLM instance once and reuse; forward api_key/api_base so
+        # self-hosted OpenAI-compatible endpoints don't require env vars.
+        create_kwargs: dict = {}
+        if self.api_key:
+            create_kwargs["api_key"] = self.api_key
+        if self.api_base:
+            create_kwargs["api_base"] = self.api_base
+        self.llm = AnyLLM.create(self.provider, **create_kwargs)
 
         logger.info(f"any-llm backend initialized (provider={provider})")
 

@@ -521,14 +521,38 @@ class HeadroomProxy(
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
         # Supports: "anthropic" (direct), "bedrock", "vertex", "litellm-<provider>", or "anyllm"
-        self.anthropic_backend: Backend | None = create_proxy_backend(
-            backend=config.backend,
-            anyllm_provider=config.anyllm_provider,
-            bedrock_region=config.bedrock_region,
-            logger=logger,
-            anyllm_backend_cls=AnyLLMBackend,
-            litellm_backend_cls=LiteLLMBackend,
-        )
+        #
+        # Capability-aware routing: when ``routing_enabled`` is set, this backend
+        # is the *self-hosted* tier (company/LAN capable model via any-llm against
+        # the configured URL+key), and the native Anthropic passthrough is the
+        # *frontier* tier. Requests are routed between them per-request (see
+        # ``proxy/backend_decision.py``). When disabled, behavior is unchanged.
+        if config.routing_enabled:
+            _proxy_logger = logging.getLogger("headroom.proxy")
+            self.anthropic_backend: Backend | None = create_proxy_backend(
+                backend="anyllm",
+                anyllm_provider=config.anyllm_provider,
+                bedrock_region=config.bedrock_region,
+                logger=_proxy_logger,
+                anyllm_backend_cls=AnyLLMBackend,
+                litellm_backend_cls=LiteLLMBackend,
+                api_base=config.routing_selfhosted_api_base,
+                api_key=config.routing_selfhosted_api_key,
+            )
+            _proxy_logger.warning(
+                "Capability-aware routing enabled (prefer=%s, selfhosted_model=%s)",
+                config.routing_prefer,
+                config.routing_selfhosted_model or "<passthrough>",
+            )
+        else:
+            self.anthropic_backend = create_proxy_backend(
+                backend=config.backend,
+                anyllm_provider=config.anyllm_provider,
+                bedrock_region=config.bedrock_region,
+                logger=logger,
+                anyllm_backend_cls=AnyLLMBackend,
+                litellm_backend_cls=LiteLLMBackend,
+            )
 
         # Request counter for IDs
         self._request_counter = 0
@@ -2972,6 +2996,11 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
+        routing_enabled=_get_env_bool("HEADROOM_ROUTING_ENABLED", False),
+        routing_prefer=_get_env_str("HEADROOM_ROUTING_PREFER", "selfhosted"),
+        routing_selfhosted_api_base=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_BASE"),
+        routing_selfhosted_api_key=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_KEY"),
+        routing_selfhosted_model=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_MODEL"),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         http2=_get_env_bool("HEADROOM_HTTP2", True),

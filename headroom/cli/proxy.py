@@ -659,6 +659,14 @@ def proxy(
         bedrock_region=bedrock_region or region,
         bedrock_profile=bedrock_profile,
         anyllm_provider=effective_anyllm_provider,
+        # Capability-aware backend routing (self-hosted/company model <-> frontier).
+        # See docs/design/local-frontier-routing.md.
+        routing_enabled=os.environ.get("HEADROOM_ROUTING_ENABLED", "").strip().lower()
+        in ("true", "1", "yes", "on"),
+        routing_prefer=os.environ.get("HEADROOM_ROUTING_PREFER", "selfhosted"),
+        routing_selfhosted_api_base=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_BASE"),
+        routing_selfhosted_api_key=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_KEY"),
+        routing_selfhosted_model=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_MODEL"),
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
         # Stateless mode: disable all filesystem writes

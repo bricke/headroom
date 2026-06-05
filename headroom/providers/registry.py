@@ -140,8 +140,16 @@ def create_proxy_backend(
     logger: logging.Logger,
     anyllm_backend_cls: Any | None = None,
     litellm_backend_cls: Any | None = None,
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> Backend | None:
-    """Create the optional translated backend for Anthropic proxy requests."""
+    """Create the optional translated backend for Anthropic proxy requests.
+
+    ``api_base``/``api_key`` are forwarded to the any-llm backend so a
+    self-hosted or company-provided OpenAI-compatible endpoint can be targeted
+    (used by capability-aware routing). When omitted, the backend falls back to
+    its own provider defaults / environment.
+    """
     if backend == "anthropic":
         return None
 
@@ -149,8 +157,15 @@ def create_proxy_backend(
         provider = anyllm_provider
         try:
             backend_cls = anyllm_backend_cls or _load_anyllm_backend()
-            instance = cast("Backend", backend_cls(provider=provider))
-            logger.info("any-llm backend enabled (provider=%s)", provider)
+            instance = cast(
+                "Backend",
+                backend_cls(provider=provider, api_key=api_key, api_base=api_base),
+            )
+            logger.info(
+                "any-llm backend enabled (provider=%s, api_base=%s)",
+                provider,
+                api_base or "<default>",
+            )
             return instance
         except ImportError as exc:
             logger.warning("any-llm backend not available: %s", exc)
