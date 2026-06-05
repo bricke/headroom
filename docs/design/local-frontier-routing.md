@@ -1,9 +1,9 @@
 # Design: Capability-Aware Backend Routing (Local/Remote ↔ Frontier)
 
-**Status:** Phase 2 complete — pending smoke test
-**Target:** `bricke/headroom` fork
+**Status:** Phase 2 complete and committed
+**Target:** `bricke/headroom` fork — branch `feat/backend-routing`
 **Author:** Matteo Brichese
-**Date:** 2026-06-04
+**Date:** 2026-06-04 (updated 2026-06-05)
 
 ---
 
@@ -474,6 +474,89 @@ OpenAI-compatible servers (some minimal implementations only expose
 load on the LLM. Users who want API-surface validation can set
 `HEADROOM_ROUTING_HEALTH_CHECK_PATH=/v1/models` explicitly.
 
+### Handler integration pattern (implementation detail)
+Both `anthropic.py` and `openai.py` use an identical routing gate structure:
+
+```python
+_original_model = body.get("model")
+_health = getattr(self, "health_prober", None)   # hoisted once; None-safe
+_route = decide_backend(self.config, self.anthropic_backend, body, _health)
+if _route.use_selfhosted and _route.routing_enabled:
+    apply_selfhosted_model(self.config, body)
+if _route.use_selfhosted:
+    try:
+        # ... dispatch to selfhosted ...
+        if status in (429, 500, 502, 503, 504):
+            if _health: _health.record_request_failure(status)
+            body["model"] = _original_model   # restore before falling through
+            logger.warning(...)
+            # no return → falls through to frontier block below
+        else:
+            if _health: _health.record_request_success()
+            # ... success path (returns) ...
+    except Exception as e:
+        if _health: _health.record_request_failure(503)
+        body["model"] = _original_model
+        await _finalize_pre_upstream()   # release semaphore before falling through
+        # no return → falls through to frontier block below
+
+# Frontier block runs naturally after the if-block when selfhosted fails
+```
+
+Key invariants:
+- `_health` is looked up exactly once per request (hoisted before the if-block).
+  `getattr(self, "health_prober", None)` is used instead of `self.health_prober`
+  so the handler is safe in unit-test contexts where the attribute is absent.
+- Fallback is achieved by **fall-through** (no `return` in failure paths), not by
+  re-executing logic. The frontier block is always reached when selfhosted fails.
+- `_original_model` is restored in the body before falling through so the frontier
+  receives the original `claude-*` model name, not the rewritten selfhosted name.
+- `_finalize_pre_upstream()` (Anthropic handler only) is idempotent — safe to call
+  in the exception handler before the frontier path calls it again. It is
+  flag-guarded internally (`_stage_timings_emitted`).
+- Streaming selfhosted paths **return** immediately (no fallback supported for
+  streaming — the SSE stream is already open). Fallback only applies to
+  non-streaming requests.
+
+### Code quality cleanup applied before commit
+Before committing, two issues were cleaned up:
+1. **DRY fix**: `_health = getattr(self, "health_prober", None)` was previously
+   assigned twice in each handler (once in the 429/5xx branch, again in the
+   `except` block). Hoisted to a single assignment before the routing gate.
+2. **KISS fix**: `_selfhosted_failed` was a dead variable — it was set to `True`
+   in failure paths but never read. Fallback is structural (fall-through), not
+   conditional on a flag. The variable was removed.
+
+### Test coverage
+**Unit tests — 40 tests, all pass (`tests/test_routing_health.py` + `tests/test_routing_decision.py`)**
+- `RoutingHealthState`: threshold, cooldown, half-open recovery, re-open after
+  half-open failure, single-failure threshold, success reset.
+- `RoutingHealthProber` lifecycle: lazy start (no task created), active start
+  (task created + initial probe), stop, idempotent stop.
+- TCP probe: success records success, failure records failure.
+- HTTP probe: 2xx records success, 5xx records failure, exception records failure.
+- Probe mode selection: TCP when `health_path=None`, HTTP when path set.
+- Host:port parsing from `api_base` (including default ports for http/https).
+- `decide()` matrix: no backend, routing disabled, prefer-selfhosted
+  (healthy / circuit-open / no prober), circuit opens progressively, circuit
+  resets after success, prefer-frontier ignores health.
+- `BackendDecision` properties: `use_selfhosted`, frozen dataclass enforcement.
+
+**Docker integration tests (manual, against running compose stack)**
+
+| Test | Selfhosted config | Result |
+|------|-------------------|--------|
+| Happy path | dante:8080 (real llama.cpp) | 200, model=`ministral-3-8b-...gguf` ✓ |
+| Exception → frontier fallback | dante:19999 (nothing listening) | `any-llm` retried twice, raised, handler fell through; Anthropic `req_011...` ID confirms frontier reached ✓ |
+| Frontier failure = no further fallback | bad Anthropic key | Auth error returned to client as-is ✓ |
+| OpenAI handler path | dante:8080 | 200, model=`ministral-3-8b-...gguf` ✓ |
+
+### Commits on `feat/backend-routing`
+| Commit | Description |
+|--------|-------------|
+| `c542c81` | Phase 1: static two-tier routing (capability-aware preference) |
+| `af5b55c` | Phase 2: availability routing with circuit breaker (this work) |
+
 ---
 
 ## 11. Open questions / decisions to make
@@ -498,4 +581,86 @@ load on the LLM. Users who want API-surface validation can set
 - **Router/health overhead must stay << the call it gates**, or the optimization is self-defeating.
 - **Upstream scope** — backend-routing may be seen as out-of-scope for a
   compression project; confirm before investing in a PR vs keeping it fork-local.
-```
+
+---
+
+## 13. PR notes (for when the PR is opened)
+
+### What this PR adds
+Two-phase capability-aware routing that lets a single Headroom instance
+intelligently split traffic between a **local/self-hosted LLM** and the
+**Anthropic frontier**, with automatic failover.
+
+**Phase 1 — static preference routing** (`c542c81`)
+- New `ProxyConfig` fields: `routing_enabled`, `routing_prefer`
+  (`selfhosted` | `frontier`), `routing_selfhosted_api_base`,
+  `routing_selfhosted_api_key`, `routing_selfhosted_model`.
+- `proxy/backend_decision.py` — immutable `BackendDecision` dataclass +
+  `decide()` function. Mirrors the `CompressionDecision` pattern.
+- `apply_selfhosted_model()` rewrites `body["model"]` in-place before dispatch.
+- Both `anthropic.py` and `openai.py` handlers updated with the routing gate.
+- Env vars: `HEADROOM_ROUTING_ENABLED`, `HEADROOM_ROUTING_PREFER`,
+  `HEADROOM_ROUTING_SELFHOSTED_API_BASE`, `HEADROOM_ROUTING_SELFHOSTED_API_KEY`,
+  `HEADROOM_ROUTING_SELFHOSTED_MODEL`.
+
+**Phase 2 — availability routing with circuit breaker** (`af5b55c`)
+- New `proxy/routing_health.py`: `RoutingHealthState` (circuit breaker state
+  machine) + `RoutingHealthProber` (lifecycle + TCP/HTTP probe dispatch).
+- Circuit opens after N consecutive failures; goes half-open after cooldown;
+  resets on first success.
+- Default is **lazy mode** (`HEADROOM_ROUTING_HEALTH_CHECK_INTERVAL=0`): no
+  background task — circuit driven entirely by live request outcomes.
+- Optional active mode: asyncio background task at user-set interval. TCP probe
+  by default; HTTP GET opt-in via `HEADROOM_ROUTING_HEALTH_CHECK_PATH`.
+- Handlers: on selfhosted 429/5xx or exception, model is restored, failure is
+  recorded, and the request falls through to the frontier block. **No return
+  statement in failure paths** — fallback is structural.
+- Frontier failures are **not caught** — they propagate directly to the client.
+- Additional env vars: `HEADROOM_ROUTING_HEALTH_CHECK_PATH`,
+  `HEADROOM_ROUTING_HEALTH_CHECK_INTERVAL`,
+  `HEADROOM_ROUTING_CIRCUIT_FAILURE_THRESHOLD`,
+  `HEADROOM_ROUTING_CIRCUIT_COOLDOWN_SECONDS`.
+
+### Key design decisions reviewers should know
+1. **Frontier stays on native Anthropic passthrough.** We never wrap frontier
+   traffic in a `Backend` object. This preserves Headroom's prompt-caching and
+   prefix-freeze optimisations, which depend on the native `_retry_request` path.
+2. **No fallback for streaming selfhosted.** Once an SSE stream is open there is
+   nowhere to fall back to. Streaming requests to selfhosted return immediately;
+   only non-streaming requests participate in fallback.
+3. **`decide()` is pure and dependency-light.** It takes config + optional prober
+   and returns a frozen dataclass. No I/O, no side effects — easy to unit test
+   and slots into Phase 3 (complexity) without structural change.
+4. **`RoutingHealthProber` is created in `server.py`** (not in `backend_decision.py`)
+   to keep the decision module stateless. The handlers access it via
+   `getattr(self, "health_prober", None)` so they are safe in unit-test contexts.
+5. **Health prober lifecycle**: `start()` in `server.startup()`;
+   `stop()` in `server.shutdown()` **before** `http_client.aclose()` to avoid
+   aiohttp teardown races.
+
+### Files changed summary
+| File | Change |
+|------|--------|
+| `headroom/proxy/routing_health.py` | New — circuit breaker + prober |
+| `headroom/proxy/backend_decision.py` | Extended `decide()` with health param |
+| `headroom/proxy/models.py` | 9 new `ProxyConfig` fields (5 Phase 1, 4 Phase 2) |
+| `headroom/proxy/server.py` | Creates/starts/stops `RoutingHealthProber` |
+| `headroom/cli/proxy.py` | Wires all env vars into `ProxyConfig` |
+| `headroom/proxy/handlers/anthropic.py` | Routing gate + fallback pattern |
+| `headroom/proxy/handlers/openai.py` | Same routing gate + fallback pattern |
+| `docs/design/local-frontier-routing.md` | This document |
+| `tests/test_routing_health.py` | 26 unit tests |
+| `tests/test_routing_decision.py` | 14 unit tests |
+
+### Test evidence
+- 40 unit tests, all pass.
+- Docker integration: happy path, bad-endpoint fallback, frontier-failure
+  propagation, and OpenAI handler path — all verified manually.
+
+### What is NOT in this PR (future phases)
+- **Phase 3**: Complexity routing — heuristic scorer sends simple requests to
+  selfhosted, complex ones to frontier.
+- **Phase 4**: Observability — Prometheus metrics for routing decisions,
+  per-request override headers.
+- **Phase 5**: Hardening + docs — README section, docker-compose example,
+  final integration tests.
