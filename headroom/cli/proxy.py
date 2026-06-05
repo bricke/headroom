@@ -667,6 +667,10 @@ def proxy(
         routing_selfhosted_api_base=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_BASE"),
         routing_selfhosted_api_key=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_KEY"),
         routing_selfhosted_model=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_MODEL"),
+        routing_health_check_path=os.environ.get("HEADROOM_ROUTING_HEALTH_CHECK_PATH") or None,
+        routing_health_check_interval=int(os.environ.get("HEADROOM_ROUTING_HEALTH_CHECK_INTERVAL", "0")),
+        routing_circuit_failure_threshold=int(os.environ.get("HEADROOM_ROUTING_CIRCUIT_FAILURE_THRESHOLD", "5")),
+        routing_circuit_cooldown_seconds=int(os.environ.get("HEADROOM_ROUTING_CIRCUIT_COOLDOWN_SECONDS", "60")),
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
         # Stateless mode: disable all filesystem writes

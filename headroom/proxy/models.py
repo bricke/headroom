@@ -119,6 +119,16 @@ class ProxyConfig:
     routing_selfhosted_api_base: str | None = None
     routing_selfhosted_api_key: str | None = None
     routing_selfhosted_model: str | None = None
+    # Health-probe + circuit-breaker (Phase 2).
+    # ``routing_health_check_path``: when set (e.g. "/v1/models"), the prober
+    # sends a GET request to that path; when unset, a plain TCP connection
+    # check is used (provider-agnostic, no API surface assumed).
+    routing_health_check_path: str | None = None
+    # 0 = lazy mode (no background probe; circuit resets only via live-request feedback).
+    # Any positive value starts a background probe at that interval (seconds).
+    routing_health_check_interval: int = 0
+    routing_circuit_failure_threshold: int = 5  # failures before circuit opens
+    routing_circuit_cooldown_seconds: int = 60  # seconds circuit stays open
 
     # Optimization mode: "token" (rewrite for max compression) or
     # "cache" (freeze prior turns for prefix-cache stability).

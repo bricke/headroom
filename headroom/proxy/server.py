@@ -539,12 +539,31 @@ class HeadroomProxy(
                 api_base=config.routing_selfhosted_api_base,
                 api_key=config.routing_selfhosted_api_key,
             )
+            # Phase 2: health prober (only created when a selfhosted endpoint is configured).
+            from headroom.proxy.routing_health import RoutingHealthProber
+
+            self.health_prober: RoutingHealthProber | None = (
+                RoutingHealthProber(
+                    api_base=config.routing_selfhosted_api_base,
+                    health_path=config.routing_health_check_path,
+                    interval_seconds=config.routing_health_check_interval,
+                    failure_threshold=config.routing_circuit_failure_threshold,
+                    cooldown_seconds=config.routing_circuit_cooldown_seconds,
+                    api_key=config.routing_selfhosted_api_key,
+                )
+                if config.routing_selfhosted_api_base
+                else None
+            )
             _proxy_logger.warning(
-                "Capability-aware routing enabled (prefer=%s, selfhosted_model=%s)",
+                "Capability-aware routing enabled (prefer=%s, selfhosted_model=%s, "
+                "health_probe=%s, circuit_threshold=%d)",
                 config.routing_prefer,
                 config.routing_selfhosted_model or "<passthrough>",
+                config.routing_health_check_path or "tcp",
+                config.routing_circuit_failure_threshold,
             )
         else:
+            self.health_prober = None
             self.anthropic_backend = create_proxy_backend(
                 backend=config.backend,
                 anyllm_provider=config.anyllm_provider,
@@ -949,6 +968,25 @@ class HeadroomProxy(
 
         logger.info("Smart Routing: ENABLED (ContentRouter is always active)")
 
+        if self.health_prober is not None:
+            await self.health_prober.start()
+            _probe_mode = (
+                "http:" + self.config.routing_health_check_path
+                if self.config.routing_health_check_path
+                else "tcp"
+            )
+            _probe_interval = self.config.routing_health_check_interval
+            if _probe_interval > 0:
+                logger.info(
+                    "Routing health prober started (mode=%s, interval=%ds)",
+                    _probe_mode,
+                    _probe_interval,
+                )
+            else:
+                logger.info(
+                    "Routing health prober started (lazy mode — circuit resets via live-request feedback only)"
+                )
+
         # Eagerly load ALL compressors, parsers, and detectors at startup
         # This eliminates cold-start latency spikes on first requests.
         # Iterate BOTH pipelines (Anthropic + OpenAI) and dedupe transforms
@@ -1127,6 +1165,9 @@ class HeadroomProxy(
 
     async def shutdown(self):
         """Cleanup async resources."""
+        if self.health_prober is not None:
+            await self.health_prober.stop()
+
         if self.http_client:
             await self.http_client.aclose()
             self.http_client = None
@@ -3001,6 +3042,10 @@ def _proxy_config_from_env() -> ProxyConfig:
         routing_selfhosted_api_base=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_BASE"),
         routing_selfhosted_api_key=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_API_KEY"),
         routing_selfhosted_model=os.environ.get("HEADROOM_ROUTING_SELFHOSTED_MODEL"),
+        routing_health_check_path=os.environ.get("HEADROOM_ROUTING_HEALTH_CHECK_PATH") or None,
+        routing_health_check_interval=_get_env_int("HEADROOM_ROUTING_HEALTH_CHECK_INTERVAL", 0),
+        routing_circuit_failure_threshold=_get_env_int("HEADROOM_ROUTING_CIRCUIT_FAILURE_THRESHOLD", 5),
+        routing_circuit_cooldown_seconds=_get_env_int("HEADROOM_ROUTING_CIRCUIT_COOLDOWN_SECONDS", 60),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         http2=_get_env_bool("HEADROOM_HTTP2", True),

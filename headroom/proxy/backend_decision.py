@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:  # avoid runtime import cycle with proxy.models / backends.base
     from headroom.backends.base import Backend
     from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.routing_health import RoutingHealthProber
 
 Target = Literal["selfhosted", "frontier"]
 
@@ -52,6 +53,7 @@ def decide(
     config: ProxyConfig,
     backend: Backend | None,
     body: dict[str, Any],
+    health: RoutingHealthProber | None = None,
 ) -> BackendDecision:
     """Return the routing decision for one request.
 
@@ -59,8 +61,9 @@ def decide(
     - No configured backend  -> always ``frontier`` (native path); nothing to route to.
     - Routing disabled       -> ``selfhosted`` whenever a backend exists (legacy:
       the configured backend handles every request).
-    - Routing enabled        -> Phase 1: honor ``routing_prefer``. (Availability
-      and complexity signals are layered in by Phases 2-3.)
+    - Routing enabled        -> Phase 2: honor ``routing_prefer`` when the selfhosted
+      endpoint is available; fall back to frontier when the circuit is open.
+      (Complexity signals slot in via Phase 3.)
     """
     if backend is None:
         return BackendDecision(target="frontier", reason="no_backend_configured")
@@ -71,8 +74,24 @@ def decide(
             reason="routing_disabled_legacy_backend",
         )
 
-    # Phase 1: constant preference. Phases 2-3 insert override -> availability ->
-    # complexity-threshold ahead of this fallthrough.
+    # Phase 2: availability gate — if we want selfhosted but the circuit is open,
+    # route to frontier instead.
+    if config.routing_prefer == "selfhosted":
+        if health is not None and not health.is_available:
+            return BackendDecision(
+                target="frontier",
+                reason="selfhosted_circuit_open",
+                routing_enabled=True,
+                selfhosted_available=False,
+            )
+        return BackendDecision(
+            target="selfhosted",
+            reason="prefer_selfhosted",
+            routing_enabled=True,
+            selfhosted_available=True,
+        )
+
+    # Phase 3 slot: complexity-threshold override goes here.
     target: Target = config.routing_prefer
     return BackendDecision(
         target=target,

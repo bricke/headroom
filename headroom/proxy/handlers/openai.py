@@ -1927,7 +1927,14 @@ class OpenAIHandlerMixin:
 
         # Route through the self-hosted/company backend (if configured / selected),
         # otherwise fall through to the native passthrough (frontier).
-        _route = decide_backend(self.config, self.anthropic_backend, body)
+        _original_model = body.get("model")
+        _health = getattr(self, "health_prober", None)
+        _route = decide_backend(
+            self.config,
+            self.anthropic_backend,
+            body,
+            _health,
+        )
         if _route.use_selfhosted and _route.routing_enabled:
             apply_selfhosted_model(self.config, body)
         if _route.use_selfhosted:
@@ -1995,178 +2002,165 @@ class OpenAIHandlerMixin:
                         },
                     )
 
-                    if backend_response.error:
+                    # Phase 2: fallback on transient selfhosted failure.
+                    _selfhosted_status = backend_response.status_code
+                    if _selfhosted_status in (429, 500, 502, 503, 504):
+                        if _health:
+                            _health.record_request_failure(_selfhosted_status)
+                        body["model"] = _original_model
+                        logger.warning(
+                            "[%s] selfhosted returned %d, falling back to frontier",
+                            request_id,
+                            _selfhosted_status,
+                        )
+                    else:
+                        if _health:
+                            _health.record_request_success()
+                        if backend_response.error:
+                            return JSONResponse(
+                                status_code=backend_response.status_code,
+                                content=backend_response.body,
+                            )
+
+                        # CCR Response Handling: intercept headroom_retrieve
+                        # tool calls server-side so a Bedrock/LiteLLM
+                        # OpenAI-shape response doesn't propagate a tool_call
+                        # the downstream caller (e.g. Strands) can't resolve.
+                        if (
+                            self.ccr_response_handler
+                            and backend_response.body
+                            and backend_response.status_code == 200
+                            and self.ccr_response_handler.has_ccr_tool_calls(
+                                backend_response.body, "openai"
+                            )
+                        ):
+                            logger.info(
+                                f"[{request_id}] CCR: Detected retrieval tool call "
+                                f"on backend path, handling via {self.anthropic_backend.name}"
+                            )
+
+                            async def api_call_fn(
+                                msgs: list[dict[str, Any]],
+                                tls: list[dict[str, Any]] | None,
+                            ) -> dict[str, Any]:
+                                continuation_body = {**body, "messages": msgs}
+                                if tls is not None:
+                                    continuation_body["tools"] = tls
+
+                                continuation_headers = {
+                                    k: v
+                                    for k, v in headers.items()
+                                    if k.lower()
+                                    not in (
+                                        "content-encoding",
+                                        "transfer-encoding",
+                                        "accept-encoding",
+                                        "content-length",
+                                    )
+                                }
+
+                                assert self.anthropic_backend is not None
+                                logger.info(
+                                    f"[{request_id}] CCR: Issuing continuation via "
+                                    f"{self.anthropic_backend.name} backend "
+                                    f"({len(msgs)} messages)"
+                                )
+                                cont_resp = await self.anthropic_backend.send_openai_message(
+                                    continuation_body, continuation_headers
+                                )
+                                return cont_resp.body
+
+                            try:
+                                final_resp_json = await self.ccr_response_handler.handle_response(
+                                    backend_response.body,
+                                    optimized_messages,
+                                    tools,
+                                    api_call_fn,
+                                    provider="openai",
+                                )
+                                backend_response.body = final_resp_json
+                                logger.info(
+                                    f"[{request_id}] CCR: Retrieval handled "
+                                    "successfully on backend path"
+                                )
+                            except Exception as e:
+                                import traceback
+
+                                logger.error(
+                                    f"[{request_id}] CCR: Response handling failed on "
+                                    f"backend path: {e}\n"
+                                    f"Traceback: {traceback.format_exc()}"
+                                )
+                                raise
+
+                        total_latency = (time.time() - start_time) * 1000
+                        usage = backend_response.body.get("usage", {})
+                        output_tokens = usage.get("completion_tokens", 0)
+                        total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
+
+                        cache_read_tokens = usage.get("cache_read_input_tokens", 0) or 0
+                        cache_creation_input_tokens = usage.get("cache_creation_input_tokens", 0) or 0
+                        if cache_read_tokens == 0:
+                            prompt_details = usage.get("prompt_tokens_details") or {}
+                            cache_read_tokens = prompt_details.get("cached_tokens", 0) or 0
+
+                        if cache_creation_input_tokens > 0:
+                            cache_write_tokens = cache_creation_input_tokens
+                        else:
+                            cache_write_tokens = _infer_openai_cache_write_tokens(
+                                total_input_tokens,
+                                cache_read_tokens,
+                            )
+
+                        openai_prefix_tracker.update_from_response(
+                            cache_read_tokens=cache_read_tokens,
+                            cache_write_tokens=cache_write_tokens,
+                            messages=optimized_messages,
+                        )
+
+                        await self._record_request_outcome(
+                            RequestOutcome(
+                                request_id=request_id,
+                                provider=self.anthropic_backend.name,
+                                model=model,
+                                original_tokens=original_tokens,
+                                optimized_tokens=total_input_tokens,
+                                output_tokens=output_tokens,
+                                tokens_saved=tokens_saved,
+                                attempted_input_tokens=total_input_tokens + tokens_saved,
+                                total_latency_ms=total_latency,
+                                overhead_ms=optimization_latency,
+                                pipeline_timing=pipeline_timing,
+                                waste_signals=waste_signals_dict,
+                                transforms_applied=tuple(transforms_applied),
+                                num_messages=len(body.get("messages", [])),
+                                tags=tags or {},
+                                request_messages=body.get("messages")
+                                if getattr(self.config, "log_full_messages", False)
+                                else None,
+                                client=client,
+                            )
+                        )
+
+                        if tokens_saved > 0:
+                            logger.info(
+                                f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
+                                f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name}"
+                            )
+
                         return JSONResponse(
                             status_code=backend_response.status_code,
                             content=backend_response.body,
                         )
-
-                    # CCR Response Handling: intercept headroom_retrieve
-                    # tool calls server-side so a Bedrock/LiteLLM
-                    # OpenAI-shape response doesn't propagate a tool_call
-                    # the downstream caller (e.g. Strands) can't resolve.
-                    # Mirrors the Anthropic handler block (anthropic.py
-                    # ~1893-2034) but on the OpenAI provider shape.
-                    #
-                    # NO SILENT FALLBACK: per feedback_no_silent_fallbacks
-                    # we re-raise on CCR errors instead of swallowing
-                    # them. The Anthropic version still swallows for
-                    # legacy reasons; align it in a follow-up.
-                    # TODO(#realignment): align anthropic.py CCR block to
-                    # re-raise on exception so both providers fail loud.
-                    if (
-                        self.ccr_response_handler
-                        and backend_response.body
-                        and backend_response.status_code == 200
-                        and self.ccr_response_handler.has_ccr_tool_calls(
-                            backend_response.body, "openai"
-                        )
-                    ):
-                        logger.info(
-                            f"[{request_id}] CCR: Detected retrieval tool call "
-                            f"on backend path, handling via {self.anthropic_backend.name}"
-                        )
-
-                        # Continuation closure — delegates transport to
-                        # the backend abstraction. We strip encoding
-                        # headers for safety even though the backend
-                        # owns transport (mirrors the Anthropic block).
-                        async def api_call_fn(
-                            msgs: list[dict[str, Any]],
-                            tls: list[dict[str, Any]] | None,
-                        ) -> dict[str, Any]:
-                            continuation_body = {**body, "messages": msgs}
-                            if tls is not None:
-                                continuation_body["tools"] = tls
-
-                            continuation_headers = {
-                                k: v
-                                for k, v in headers.items()
-                                if k.lower()
-                                not in (
-                                    "content-encoding",
-                                    "transfer-encoding",
-                                    "accept-encoding",
-                                    "content-length",
-                                )
-                            }
-
-                            assert self.anthropic_backend is not None
-                            logger.info(
-                                f"[{request_id}] CCR: Issuing continuation via "
-                                f"{self.anthropic_backend.name} backend "
-                                f"({len(msgs)} messages)"
-                            )
-                            cont_resp = await self.anthropic_backend.send_openai_message(
-                                continuation_body, continuation_headers
-                            )
-                            return cont_resp.body
-
-                        try:
-                            final_resp_json = await self.ccr_response_handler.handle_response(
-                                backend_response.body,
-                                optimized_messages,
-                                tools,
-                                api_call_fn,
-                                provider="openai",
-                            )
-                            backend_response.body = final_resp_json
-                            logger.info(
-                                f"[{request_id}] CCR: Retrieval handled "
-                                "successfully on backend path"
-                            )
-                        except Exception as e:
-                            import traceback
-
-                            logger.error(
-                                f"[{request_id}] CCR: Response handling failed on "
-                                f"backend path: {e}\n"
-                                f"Traceback: {traceback.format_exc()}"
-                            )
-                            # No silent fallback — fail loud per
-                            # feedback_no_silent_fallbacks.md.
-                            raise
-
-                    # Extract usage from the FINAL backend body (after
-                    # any CCR resolution) so the prefix tracker counts
-                    # cache stats from the LAST upstream call.
-                    total_latency = (time.time() - start_time) * 1000
-                    usage = backend_response.body.get("usage", {})
-                    output_tokens = usage.get("completion_tokens", 0)
-                    total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
-
-                    # Cache stats: prefer the Anthropic/Bedrock top-level
-                    # keys when present (authoritative). Fall back to
-                    # OpenAI's `prompt_tokens_details.cached_tokens` only
-                    # if the top-level keys are absent/zero.
-                    cache_read_tokens = usage.get("cache_read_input_tokens", 0) or 0
-                    cache_creation_input_tokens = usage.get("cache_creation_input_tokens", 0) or 0
-                    if cache_read_tokens == 0:
-                        prompt_details = usage.get("prompt_tokens_details") or {}
-                        cache_read_tokens = prompt_details.get("cached_tokens", 0) or 0
-
-                    # Bedrock reports cache creation directly. Only infer
-                    # when no explicit count is available.
-                    if cache_creation_input_tokens > 0:
-                        cache_write_tokens = cache_creation_input_tokens
-                    else:
-                        cache_write_tokens = _infer_openai_cache_write_tokens(
-                            total_input_tokens,
-                            cache_read_tokens,
-                        )
-
-                    openai_prefix_tracker.update_from_response(
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        messages=optimized_messages,
-                    )
-
-                    await self._record_request_outcome(
-                        RequestOutcome(
-                            request_id=request_id,
-                            provider=self.anthropic_backend.name,
-                            model=model,
-                            original_tokens=original_tokens,
-                            optimized_tokens=total_input_tokens,
-                            output_tokens=output_tokens,
-                            tokens_saved=tokens_saved,
-                            attempted_input_tokens=total_input_tokens + tokens_saved,
-                            total_latency_ms=total_latency,
-                            overhead_ms=optimization_latency,
-                            pipeline_timing=pipeline_timing,
-                            waste_signals=waste_signals_dict,
-                            transforms_applied=tuple(transforms_applied),
-                            num_messages=len(body.get("messages", [])),
-                            tags=tags or {},
-                            request_messages=body.get("messages")
-                            if getattr(self.config, "log_full_messages", False)
-                            else None,
-                            client=client,
-                        )
-                    )
-
-                    if tokens_saved > 0:
-                        logger.info(
-                            f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
-                            f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name}"
-                        )
-
-                    return JSONResponse(
-                        status_code=backend_response.status_code,
-                        content=backend_response.body,
-                    )
             except Exception as e:
-                logger.error(f"[{request_id}] Backend error: {e}")
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": {
-                            "message": str(e),
-                            "type": "api_error",
-                            "code": "backend_error",
-                        }
-                    },
+                logger.warning(
+                    "[%s] selfhosted backend error: %s — falling back to frontier",
+                    request_id,
+                    e,
                 )
+                if _health:
+                    _health.record_request_failure(503)
+                body["model"] = _original_model
 
         # Direct OpenAI API (no backend configured)
         url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/chat/completions")

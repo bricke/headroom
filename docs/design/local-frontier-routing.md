@@ -1,6 +1,6 @@
 # Design: Capability-Aware Backend Routing (Local/Remote ↔ Frontier)
 
-**Status:** Phase 1 complete — smoke test passing
+**Status:** Phase 2 complete — pending smoke test
 **Target:** `bricke/headroom` fork
 **Author:** Matteo Brichese
 **Date:** 2026-06-04
@@ -396,7 +396,87 @@ the library's validation without affecting the actual self-hosted endpoint.
 
 ---
 
-## 10. Open questions / decisions to make
+## 10. Implementation notes (Phase 2)
+
+### What was built
+Phase 2 adds availability awareness to the router: a circuit breaker driven by
+live-request feedback, an optional background health prober, and automatic
+fallback from selfhosted to frontier on 429/5xx responses or backend exceptions.
+Frontier failures are **not** retried — the error is returned to the agent as-is.
+
+### Files changed
+| File | Change |
+|------|--------|
+| `headroom/proxy/routing_health.py` | **New module**: `RoutingHealthState` (circuit breaker) + `RoutingHealthProber` (TCP or HTTP GET probe) |
+| `headroom/proxy/backend_decision.py` | `decide()` now accepts optional `health` prober; routes to frontier when circuit is open (`reason="selfhosted_circuit_open"`) |
+| `headroom/proxy/models.py` | 4 new `ProxyConfig` fields: `routing_health_check_path`, `routing_health_check_interval`, `routing_circuit_failure_threshold`, `routing_circuit_cooldown_seconds` |
+| `headroom/proxy/server.py` | Creates `RoutingHealthProber` in `__init__`; starts/stops it in `startup`/`shutdown`; env-var wiring |
+| `headroom/cli/proxy.py` | Env-var wiring |
+| `headroom/proxy/handlers/anthropic.py` | Saves `_original_model`; passes health prober to `decide_backend`; fallback on 429/5xx or exception |
+| `headroom/proxy/handlers/openai.py` | Same pattern |
+
+### Configuration (new env vars)
+```
+# Probe mode: unset = TCP connect-only (provider-agnostic, default).
+# Set to a path (e.g. /v1/models) to do an HTTP GET instead.
+HEADROOM_ROUTING_HEALTH_CHECK_PATH=        # e.g. /v1/models (optional)
+
+# Probe interval in seconds. 0 = lazy mode (no background probe, default).
+# Any positive value starts a background probe at that interval.
+HEADROOM_ROUTING_HEALTH_CHECK_INTERVAL=0   # e.g. 300 for 5-minute probing
+
+# Circuit breaker: open after N consecutive failures.
+HEADROOM_ROUTING_CIRCUIT_FAILURE_THRESHOLD=5
+
+# Cooldown: circuit stays open for N seconds before allowing through again.
+HEADROOM_ROUTING_CIRCUIT_COOLDOWN_SECONDS=60
+```
+
+### Health probe modes
+Two probe modes are available, selected by `HEADROOM_ROUTING_HEALTH_CHECK_PATH`:
+
+- **TCP (default, path unset):** opens a TCP connection to the `api_base`
+  host:port and immediately closes it. Provider-agnostic — works on any HTTP
+  server without assuming a specific API surface. Zero load on the LLM process.
+- **HTTP GET (path set):** sends a GET to the configured path. Useful to verify
+  the API surface is responding, not just that the port is open. The path must
+  be chosen carefully — `/v1/models` is standard for OpenAI-compatible servers
+  but is not universal. Use the TCP default when in doubt.
+
+### Background probe vs lazy mode
+- **Lazy mode (`interval=0`, default):** no background task. The circuit breaker
+  is driven entirely by live-request feedback. Recovery happens on the next live
+  request after the cooldown expires (half-open: one request allowed through).
+- **Background probe (`interval>0`):** a background asyncio task probes the
+  endpoint on the configured interval and feeds results into the circuit breaker.
+  Use when you want proactive recovery without waiting for a live request — at the
+  cost of background network activity even when idle.
+
+### Fallback behaviour
+For every selfhosted request:
+1. If the circuit is **open** at decision time → `decide()` returns
+   `target="frontier"` with `reason="selfhosted_circuit_open"` — no request is
+   sent to the selfhosted endpoint.
+2. If the circuit is **closed** but the live request returns 429 or 5xx →
+   the handler records a failure (may open the circuit), restores the original
+   `claude-*` model name in the body, and falls through to the frontier path.
+3. If the live request **raises an exception** (connection refused, timeout, etc.)
+   → same as (2), plus `_finalize_pre_upstream()` is called to release the
+   pre-upstream semaphore before falling through.
+4. If the **frontier path fails** → the error is returned to the agent. No further
+   fallback.
+
+### Design decision: no `/v1/models` default
+An earlier draft used `/v1/models` as the default health-check path. This was
+changed to a TCP probe because `/v1/models` is not guaranteed on all
+OpenAI-compatible servers (some minimal implementations only expose
+`/v1/chat/completions`). The TCP probe is provider-agnostic and imposes zero
+load on the LLM. Users who want API-surface validation can set
+`HEADROOM_ROUTING_HEALTH_CHECK_PATH=/v1/models` explicitly.
+
+---
+
+## 11. Open questions / decisions to make
 1. **Override interface** — header name and/or model-alias convention for forcing a tier.
 2. **Routing granularity** — global, or only when a specific model alias is requested?
 3. **Health-probe cost** — ping-per-request vs cached TTL; what TTL is acceptable.
@@ -410,7 +490,7 @@ the library's validation without affecting the actual self-hosted endpoint.
 
 ---
 
-## 10. Risks
+## 12. Risks
 - **Single-backend assumption is load-bearing.** Widening it touches startup and
   the handler dispatch contract; the wrapper approach contains the blast radius but
   must faithfully implement the whole `Backend` ABC (incl. `name`, `close`, model mapping).

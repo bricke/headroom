@@ -1664,7 +1664,14 @@ class AnthropicHandlerMixin:
             # Forward request - route to the self-hosted/company backend (if
             # configured / selected), otherwise fall through to the native
             # Anthropic passthrough (frontier). See proxy/backend_decision.py.
-            _route = decide_backend(self.config, self.anthropic_backend, body)
+            _original_model = body.get("model")
+            _health = getattr(self, "health_prober", None)
+            _route = decide_backend(
+                self.config,
+                self.anthropic_backend,
+                body,
+                _health,
+            )
             if _route.use_selfhosted and _route.routing_enabled:
                 apply_selfhosted_model(self.config, body)
             if _route.use_selfhosted:
@@ -1740,83 +1747,81 @@ class AnthropicHandlerMixin:
                                 "upstream_first_byte",
                                 stage_timer.summary()["upstream_connect"],
                             )
-                        await _finalize_pre_upstream()
-                        if backend_response.error:
+                        # Phase 2: fallback on transient selfhosted failure.
+                        _selfhosted_status = backend_response.status_code
+                        if _selfhosted_status in (429, 500, 502, 503, 504):
+                            if _health:
+                                _health.record_request_failure(_selfhosted_status)
+                            body["model"] = _original_model
+                            logger.warning(
+                                "[%s] selfhosted returned %d, falling back to frontier",
+                                request_id,
+                                _selfhosted_status,
+                            )
+                        else:
+                            if _health:
+                                _health.record_request_success()
+                            await _finalize_pre_upstream()
+                            if backend_response.error:
+                                return JSONResponse(
+                                    status_code=backend_response.status_code,
+                                    content=backend_response.body,
+                                )
+
+                            # Track metrics
+                            total_latency = (time.time() - start_time) * 1000
+                            usage = backend_response.body.get("usage", {})
+                            output_tokens = usage.get("output_tokens", 0)
+
+                            _backend_name = (
+                                self.anthropic_backend.name if self.anthropic_backend else "anthropic"
+                            )
+                            try:
+                                attempted_input_tokens = tokenizer.count_messages(
+                                    original_client_messages[frozen_message_count:]
+                                )
+                            except Exception:
+                                attempted_input_tokens = original_tokens
+                            await self._record_request_outcome(
+                                RequestOutcome(
+                                    request_id=request_id,
+                                    provider=_backend_name,
+                                    model=model,
+                                    original_tokens=original_tokens,
+                                    optimized_tokens=optimized_tokens,
+                                    output_tokens=output_tokens,
+                                    tokens_saved=tokens_saved,
+                                    attempted_input_tokens=attempted_input_tokens,
+                                    total_latency_ms=total_latency,
+                                    overhead_ms=optimization_latency,
+                                    pipeline_timing=pipeline_timing,
+                                    transforms_applied=tuple(transforms_applied),
+                                    num_messages=len(body.get("messages", [])),
+                                    tags=tags,
+                                    client=client,
+                                    turn_id=compute_turn_id(
+                                        model, body.get("system"), body.get("messages")
+                                    ),
+                                    request_messages=body.get("messages")
+                                    if self.config.log_full_messages
+                                    else None,
+                                )
+                            )
+
                             return JSONResponse(
                                 status_code=backend_response.status_code,
                                 content=backend_response.body,
                             )
-
-                        # Track metrics
-                        total_latency = (time.time() - start_time) * 1000
-                        usage = backend_response.body.get("usage", {})
-                        output_tokens = usage.get("output_tokens", 0)
-
-                        _backend_name = (
-                            self.anthropic_backend.name if self.anthropic_backend else "anthropic"
-                        )
-                        # Eligible-only denominator for the active
-                        # compression ratio: tokens in the live zone we
-                        # actually attempted to compress. Frozen prefix
-                        # (system + prior cached turns) is byte-identical
-                        # pre/post — counting it would dilute the metric
-                        # with content we deliberately don't touch for
-                        # prefix-cache safety. Fall back to the full
-                        # pre-comp request if the live-zone count fails
-                        # so the aggregate denominator stays coherent.
-                        try:
-                            attempted_input_tokens = tokenizer.count_messages(
-                                original_client_messages[frozen_message_count:]
-                            )
-                        except Exception:
-                            attempted_input_tokens = original_tokens
-                        # Backend (Bedrock / Vertex) non-streaming.
-                        # Cache metrics aren't extracted from the backend
-                        # response here yet — that's a follow-up. The
-                        # funnel passes 0s for the cache fields, which
-                        # is the same observable behaviour as the
-                        # pre-refactor code (which also omitted them).
-                        await self._record_request_outcome(
-                            RequestOutcome(
-                                request_id=request_id,
-                                provider=_backend_name,
-                                model=model,
-                                original_tokens=original_tokens,
-                                optimized_tokens=optimized_tokens,
-                                output_tokens=output_tokens,
-                                tokens_saved=tokens_saved,
-                                attempted_input_tokens=attempted_input_tokens,
-                                total_latency_ms=total_latency,
-                                overhead_ms=optimization_latency,
-                                pipeline_timing=pipeline_timing,
-                                transforms_applied=tuple(transforms_applied),
-                                num_messages=len(body.get("messages", [])),
-                                tags=tags,
-                                client=client,
-                                turn_id=compute_turn_id(
-                                    model, body.get("system"), body.get("messages")
-                                ),
-                                request_messages=body.get("messages")
-                                if self.config.log_full_messages
-                                else None,
-                            )
-                        )
-
-                        return JSONResponse(
-                            status_code=backend_response.status_code,
-                            content=backend_response.body,
-                        )
                 except Exception as e:
-                    logger.error(f"[{request_id}] Bedrock backend error: {e}")
-                    # Unit 4: release the pre-upstream semaphore on error.
-                    await _finalize_pre_upstream()
-                    return JSONResponse(
-                        status_code=500,
-                        content={
-                            "type": "error",
-                            "error": {"type": "api_error", "message": str(e)},
-                        },
+                    logger.warning(
+                        "[%s] selfhosted backend error: %s — falling back to frontier",
+                        request_id,
+                        e,
                     )
+                    if _health:
+                        _health.record_request_failure(503)
+                    body["model"] = _original_model
+                    await _finalize_pre_upstream()
 
             # Direct Anthropic API
             url = f"{self.ANTHROPIC_API_URL}/v1/messages"
