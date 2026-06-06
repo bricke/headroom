@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.backend_decision import decide as decide_backend
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import extract_tags
 from headroom.proxy.outcome import RequestOutcome
@@ -71,6 +72,68 @@ class GeminiHandlerMixin:
             ):
                 return True
         return False
+
+    def _gemini_body_to_openai_body(
+        self, gemini_body: dict, messages: list[dict]
+    ) -> dict:
+        """Build an OpenAI chat completions body from a Gemini body + pre-converted messages.
+
+        Used when routing a Gemini request to an OpenAI-compatible selfhosted endpoint.
+        The caller must already have converted ``contents[]`` to ``messages[]`` via
+        ``_gemini_contents_to_messages()``.
+        """
+        openai_body: dict = {"messages": messages}
+        if self.config.routing_selfhosted_model:
+            openai_body["model"] = self.config.routing_selfhosted_model
+        gen = gemini_body.get("generationConfig", {})
+        if "maxOutputTokens" in gen:
+            openai_body["max_tokens"] = gen["maxOutputTokens"]
+        if "temperature" in gen:
+            openai_body["temperature"] = gen["temperature"]
+        if "topP" in gen:
+            openai_body["top_p"] = gen["topP"]
+        if "stopSequences" in gen:
+            openai_body["stop"] = gen["stopSequences"]
+        return openai_body
+
+    def _openai_response_to_gemini_response(
+        self, openai_body: dict, model: str
+    ) -> dict:
+        """Convert an OpenAI chat completions response to Gemini generateContent format.
+
+        Used when a selfhosted OpenAI-compatible endpoint returns a response that the
+        Gemini-format client expects in Gemini wire format.
+        """
+        _finish_map = {
+            "stop": "STOP",
+            "length": "MAX_TOKENS",
+            "content_filter": "SAFETY",
+            "tool_calls": "STOP",
+        }
+        candidates = []
+        for choice in openai_body.get("choices", []):
+            message = choice.get("message", {})
+            candidates.append(
+                {
+                    "content": {
+                        "parts": [{"text": message.get("content", "") or ""}],
+                        "role": "model",
+                    },
+                    "finishReason": _finish_map.get(
+                        choice.get("finish_reason", "stop"), "STOP"
+                    ),
+                    "index": choice.get("index", 0),
+                }
+            )
+        gemini_resp: dict = {"candidates": candidates, "modelVersion": model}
+        usage = openai_body.get("usage", {})
+        if usage:
+            gemini_resp["usageMetadata"] = {
+                "promptTokenCount": usage.get("prompt_tokens", 0),
+                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "totalTokenCount": usage.get("total_tokens", 0),
+            }
+        return gemini_resp
 
     def _gemini_contents_to_messages(
         self, contents: list[dict], system_instruction: dict | None = None
@@ -468,6 +531,75 @@ class GeminiHandlerMixin:
         # Preserve API key in query params if present
         if "key" in query_params:
             url += f"?key={query_params['key']}"
+
+        # Route through the self-hosted backend when configured and healthy.
+        # Streaming: OpenAI→Gemini SSE conversion is not yet implemented — streaming
+        # always uses the Gemini frontier path.
+        _health = getattr(self, "health_prober", None)
+        _route = decide_backend(self.config, self.anthropic_backend, body, _health)
+        if _route.use_selfhosted and not is_streaming:
+            try:
+                openai_body = self._gemini_body_to_openai_body(body, optimized_messages)
+                backend_response = await self.anthropic_backend.send_openai_message(
+                    openai_body, headers
+                )
+                _selfhosted_status = backend_response.status_code
+                if _selfhosted_status in (429, 500, 502, 503, 504):
+                    if _health:
+                        _health.record_request_failure(_selfhosted_status)
+                    logger.warning(
+                        "[%s] selfhosted returned %d, falling back to frontier (gemini)",
+                        request_id,
+                        _selfhosted_status,
+                    )
+                    # no return → falls through to frontier block
+                else:
+                    if _health:
+                        _health.record_request_success()
+                    gemini_resp_body = self._openai_response_to_gemini_response(
+                        backend_response.body, model
+                    )
+                    usage_meta = gemini_resp_body.get("usageMetadata", {})
+                    total_input_tokens = usage_meta.get("promptTokenCount", optimized_tokens)
+                    output_tokens_sh = usage_meta.get("candidatesTokenCount", 0)
+                    total_latency = (time.time() - start_time) * 1000
+                    outcome = RequestOutcome(
+                        request_id=request_id,
+                        provider="gemini",
+                        model=model,
+                        original_tokens=original_tokens,
+                        optimized_tokens=total_input_tokens,
+                        output_tokens=output_tokens_sh,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=total_input_tokens + tokens_saved,
+                        total_latency_ms=total_latency,
+                        overhead_ms=optimization_latency,
+                        waste_signals=waste_signals_dict,
+                        transforms_applied=tuple(transforms_applied),
+                        num_messages=len(body.get("contents", [])),
+                        tags=tags or {},
+                        client=client,
+                    )
+                    await self._record_request_outcome(outcome)
+                    return JSONResponse(
+                        status_code=backend_response.status_code,
+                        content=gemini_resp_body,
+                    )
+            except Exception as e:
+                if _health:
+                    _health.record_request_failure(503)
+                logger.warning(
+                    "[%s] selfhosted error: %s — falling back to frontier (gemini)",
+                    request_id,
+                    e,
+                )
+                # no return → falls through to frontier block
+        elif _route.use_selfhosted and is_streaming:
+            logger.warning(
+                "[%s] selfhosted routing not yet supported for Gemini streaming; using frontier",
+                request_id,
+            )
+            # fall through
 
         try:
             if is_streaming:
