@@ -1,7 +1,7 @@
-# Local smoke-test override for capability-aware backend routing.
-# Routes traffic to the self-hosted llama.cpp model on `dante` and skips the
-# heavy qdrant/neo4j memory services (stateless) so only the proxy runs.
-# Not for production — see docs/design/local-frontier-routing.md.
+# Local override for capability-aware backend routing smoke tests.
+# Copy to docker-compose.override.yml and fill in your values.
+# Skips qdrant/neo4j so only the proxy runs (stateless mode).
+# See docs/design/local-frontier-routing.md for full setup instructions.
 services:
   headroom-proxy:
     build:
@@ -9,14 +9,12 @@ services:
       args:
         HEADROOM_EXTRAS: proxy,code,anyllm
     depends_on: []
-    extra_hosts:
-      - "dante:192.168.0.175"
     environment:
       - HEADROOM_HOST=0.0.0.0
       - HEADROOM_STATELESS=true
       - HEADROOM_ROUTING_ENABLED=true
       - HEADROOM_ROUTING_PREFER=selfhosted
       - HEADROOM_ANYLLM_PROVIDER=openai
-      - HEADROOM_ROUTING_SELFHOSTED_API_BASE=http://dante:8080/v1
-      - HEADROOM_ROUTING_SELFHOSTED_API_KEY=llama-cpp-no-key
-      - HEADROOM_ROUTING_SELFHOSTED_MODEL=ministral-3-8b-creative-q5_k_m.gguf
+      - HEADROOM_ROUTING_SELFHOSTED_API_BASE=http://your-local-llm-host:8080/v1
+      - HEADROOM_ROUTING_SELFHOSTED_API_KEY=your-api-key-or-placeholder
+      - HEADROOM_ROUTING_SELFHOSTED_MODEL=your-local-model-name
