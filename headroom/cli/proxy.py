@@ -671,6 +671,7 @@ def proxy(
         routing_health_check_interval=int(os.environ.get("HEADROOM_ROUTING_HEALTH_CHECK_INTERVAL", "0")),
         routing_circuit_failure_threshold=int(os.environ.get("HEADROOM_ROUTING_CIRCUIT_FAILURE_THRESHOLD", "5")),
         routing_circuit_cooldown_seconds=int(os.environ.get("HEADROOM_ROUTING_CIRCUIT_COOLDOWN_SECONDS", "60")),
+        routing_complexity_threshold=float(os.environ.get("HEADROOM_ROUTING_COMPLEXITY_THRESHOLD", "0.5")),
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
         # Stateless mode: disable all filesystem writes

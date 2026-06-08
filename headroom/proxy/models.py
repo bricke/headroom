@@ -113,7 +113,7 @@ class ProxyConfig:
     # docs/design/local-frontier-routing.md.
     routing_enabled: bool = False
     # Default tier when routing is enabled and no stronger signal applies.
-    routing_prefer: Literal["selfhosted", "frontier"] = "selfhosted"
+    routing_prefer: Literal["selfhosted", "frontier", "auto"] = "selfhosted"
     # Self-hosted/company endpoint connection (URL + key + model). For a raw LAN
     # Ollama box, set api_base to the LAN URL and leave api_key empty.
     routing_selfhosted_api_base: str | None = None
@@ -129,6 +129,12 @@ class ProxyConfig:
     routing_health_check_interval: int = 0
     routing_circuit_failure_threshold: int = 5  # failures before circuit opens
     routing_circuit_cooldown_seconds: int = 60  # seconds circuit stays open
+
+    # Phase 3: complexity routing (routing_prefer=auto).
+    # Requests scoring >= threshold route to frontier; below threshold → selfhosted.
+    # Raise for a more capable local model (e.g. 0.7 for Qwen-72B).
+    # Lower for a less capable model (e.g. 0.3 for Qwen-9B).
+    routing_complexity_threshold: float = 0.5
 
     # Optimization mode: "token" (rewrite for max compression) or
     # "cache" (freeze prior turns for prefix-cache stability).

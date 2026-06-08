@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from headroom.proxy.routing_complexity import score_complexity
+
 if TYPE_CHECKING:  # avoid runtime import cycle with proxy.models / backends.base
     from headroom.backends.base import Backend
     from headroom.proxy.models import ProxyConfig
@@ -91,7 +93,31 @@ def decide(
             selfhosted_available=True,
         )
 
-    # Phase 3 slot: complexity-threshold override goes here.
+    # Phase 3: complexity routing — score the request and compare to threshold.
+    if config.routing_prefer == "auto":
+        if health is not None and not health.is_available:
+            return BackendDecision(
+                target="frontier",
+                reason="selfhosted_circuit_open",
+                routing_enabled=True,
+                selfhosted_available=False,
+            )
+        complexity = score_complexity(body)
+        if complexity >= config.routing_complexity_threshold:
+            return BackendDecision(
+                target="frontier",
+                reason="complexity_above_threshold",
+                routing_enabled=True,
+                complexity_score=complexity,
+            )
+        return BackendDecision(
+            target="selfhosted",
+            reason="complexity_below_threshold",
+            routing_enabled=True,
+            selfhosted_available=True,
+            complexity_score=complexity,
+        )
+
     target: Target = config.routing_prefer
     return BackendDecision(
         target=target,
