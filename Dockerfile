@@ -1,10 +1,11 @@
 ARG PYTHON_VERSION=3.13
 ARG UV_VERSION=0.11.20
-ARG DISTROLESS_IMAGE=gcr.io/distroless/python3-debian13
+ARG DEBIAN_VARIANT=slim-bookworm
+ARG DISTROLESS_IMAGE=gcr.io/distroless/python3-debian12
 ARG PYTHON_SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 
 # ---- Build stage: compile native extensions, build wheel ----
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM python:${PYTHON_VERSION}-${DEBIAN_VARIANT} AS builder
 
 ARG UV_VERSION
 
@@ -61,7 +62,7 @@ RUN cd /tmp && python -c "from headroom._core import DiffCompressor, SmartCrushe
     print(f'build-stage rust core verify OK: {DiffCompressor.__name__}, {SmartCrusher.__name__}')"
 
 # ---- Runtime stage (python-slim): supports root/nonroot via build arg ----
-FROM python:${PYTHON_VERSION}-slim AS runtime-slim-base
+FROM python:${PYTHON_VERSION}-${DEBIAN_VARIANT} AS runtime-slim-base
 
 ARG RUNTIME_USER=nonroot
 ARG PYTHON_SITE_PACKAGES
