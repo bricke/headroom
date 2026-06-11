@@ -67,6 +67,34 @@ class AnyLLMBackend(Backend):
         """any-llm supports any model the provider supports."""
         return True
 
+    @staticmethod
+    def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert Anthropic-format tool definitions to OpenAI function-calling format.
+
+        Anthropic: {"type": "custom", "name": ..., "description": ..., "input_schema": {...}}
+        OpenAI:    {"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}
+        """
+        converted = []
+        for tool in tools:
+            # Already in OpenAI format
+            if tool.get("type") == "function" and "function" in tool:
+                converted.append(tool)
+                continue
+            # Anthropic custom/computer_use/text_editor built-ins pass through unchanged
+            # only if they're not the user-defined "custom" type that OpenAI rejects.
+            name = tool.get("name", "")
+            description = tool.get("description", "")
+            parameters = tool.get("input_schema", tool.get("parameters", {}))
+            converted.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            })
+        return converted
+
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert Anthropic message format to OpenAI/any-llm format."""
         converted = []
@@ -221,7 +249,7 @@ class AnyLLMBackend(Backend):
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
             if "tools" in body:
-                kwargs["tools"] = body["tools"]
+                kwargs["tools"] = self._convert_tools_to_openai(body["tools"])
             if "tool_choice" in body:
                 kwargs["tool_choice"] = body["tool_choice"]
 
@@ -271,7 +299,7 @@ class AnyLLMBackend(Backend):
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
             if "tools" in body:
-                kwargs["tools"] = body["tools"]
+                kwargs["tools"] = self._convert_tools_to_openai(body["tools"])
             if "tool_choice" in body:
                 kwargs["tool_choice"] = body["tool_choice"]
 
