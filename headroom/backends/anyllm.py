@@ -466,19 +466,28 @@ class AnyLLMBackend(Backend):
 
     def _error_response(self, e: Exception, openai_format: bool = False) -> BackendResponse:
         """Build error response from exception."""
+        import re as _re
+
         error_type = "api_error"
         status_code = 500
+
+        # Prefer the actual HTTP status code from the exception string (e.g.
+        # "Error code: 503 - ...") over keyword heuristics, so that transient
+        # backend errors (503 loading, 429 rate-limit) preserve their real code
+        # and the anthropic handler's fallback list can make the right decision.
+        _http_code_match = _re.search(r"(?:error code|status)[:\s]+(\d{3})", str(e), _re.IGNORECASE)
+        if _http_code_match:
+            status_code = int(_http_code_match.group(1))
 
         error_str = str(e).lower()
         if "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
             error_type = "invalid_api_key" if openai_format else "authentication_error"
-            status_code = 401
+            if not _http_code_match:
+                status_code = 401
         elif "rate" in error_str or "limit" in error_str:
             error_type = "rate_limit_exceeded" if openai_format else "rate_limit_error"
-            status_code = 429
-        elif "not found" in error_str or "model" in error_str:
-            error_type = "model_not_found" if openai_format else "not_found_error"
-            status_code = 404
+            if not _http_code_match:
+                status_code = 429
 
         body: dict[str, Any]
         if openai_format:
