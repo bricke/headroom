@@ -129,6 +129,25 @@ class AnthropicHandlerMixin:
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
 
+    # Fields that some AI SDK clients (e.g. OpenCode's @ai-sdk/anthropic) inject
+    # into tool definitions but that Anthropic's API rejects as unknown.
+    _TOOL_STRIP_FIELDS: frozenset[str] = frozenset({"eager_input_streaming"})
+
+    @classmethod
+    def _normalize_tool(cls, tool: dict[str, Any]) -> dict[str, Any]:
+        """Ensure a tool definition is valid for the Anthropic API.
+
+        - Adds ``"type": "custom"`` when the field is absent (required since
+          Anthropic API 2025-04 for user-defined tools).
+        - Strips client-private fields that Anthropic rejects (e.g.
+          ``eager_input_streaming`` from @ai-sdk/anthropic).
+        """
+        if not cls._TOOL_STRIP_FIELDS.isdisjoint(tool) or "type" not in tool:
+            tool = {k: v for k, v in tool.items() if k not in cls._TOOL_STRIP_FIELDS}
+            if "type" not in tool:
+                tool = {"type": "custom", **tool}
+        return tool
+
     @classmethod
     def _sort_tools_deterministically(
         cls, tools: list[dict[str, Any]] | None
@@ -136,7 +155,7 @@ class AnthropicHandlerMixin:
         """Return tools in deterministic order to preserve prompt-cache stability."""
         if not tools:
             return tools
-        return sorted(tools, key=cls._tool_sort_key)
+        return sorted((cls._normalize_tool(t) for t in tools), key=cls._tool_sort_key)
 
     @staticmethod
     def _compress_latest_user_turn_images_cache_safe(
