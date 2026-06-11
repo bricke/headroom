@@ -1768,14 +1768,19 @@ class AnthropicHandlerMixin:
                             )
                         # Phase 2: fallback on transient selfhosted failure.
                         _selfhosted_status = backend_response.status_code
-                        if _selfhosted_status in (429, 500, 502, 503, 504):
+                        _context_overflow = _selfhosted_status == 400 and any(
+                            kw in str(backend_response.body).lower()
+                            for kw in ("context", "token", "length", "exceed", "too long", "too large")
+                        )
+                        if _selfhosted_status in (429, 500, 502, 503, 504) or _context_overflow:
                             if _health:
                                 _health.record_request_failure(_selfhosted_status)
                             body["model"] = _original_model
                             logger.warning(
-                                "[%s] selfhosted returned %d, falling back to frontier",
+                                "[%s] selfhosted returned %d%s, falling back to frontier",
                                 request_id,
                                 _selfhosted_status,
+                                " (context overflow)" if _context_overflow else "",
                             )
                         else:
                             if _health:
