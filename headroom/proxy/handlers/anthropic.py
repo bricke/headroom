@@ -1691,6 +1691,16 @@ class AnthropicHandlerMixin:
                 body,
                 _health,
             )
+            logger.warning(
+                "[%s] routing: target=%s reason=%s score=%s circuit=%s stream=%s tokens=%d",
+                request_id,
+                _route.target,
+                _route.reason,
+                f"{_route.complexity_score:.3f}" if _route.complexity_score is not None else "n/a",
+                "open" if (_health and not _health.is_available()) else "closed",
+                stream,
+                original_tokens,
+            )
             if _route.use_selfhosted and _route.routing_enabled:
                 apply_selfhosted_model(self.config, body)
             if _route.use_selfhosted:
