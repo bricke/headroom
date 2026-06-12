@@ -1697,7 +1697,7 @@ class AnthropicHandlerMixin:
                 _route.target,
                 _route.reason,
                 f"{_route.complexity_score:.3f}" if _route.complexity_score is not None else "n/a",
-                "open" if (_health and not _health.is_available()) else "closed",
+                "open" if (_health and not _health.is_available) else "closed",
                 stream,
                 original_tokens,
             )
