@@ -1708,7 +1708,7 @@ class AnthropicHandlerMixin:
                             metadata={"path": "/v1/messages", "stream": True},
                         )
                         await _finalize_pre_upstream()
-                        return await self._stream_response_bedrock(
+                        _stream_resp = await self._stream_response_bedrock(
                             body,
                             headers,
                             "anthropic",
@@ -1721,7 +1721,12 @@ class AnthropicHandlerMixin:
                             tags,
                             optimization_latency,
                             pipeline_timing=pipeline_timing,
+                            original_model=_original_model,
+                            health=_health,
                         )
+                        if _stream_resp is not None:
+                            return _stream_resp
+                        # None = selfhosted errored before yielding — fall through to frontier
                     else:
                         async with stage_timer.measure("upstream_connect"):
                             backend_response = await self.anthropic_backend.send_message(

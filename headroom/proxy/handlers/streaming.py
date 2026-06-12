@@ -1322,10 +1322,17 @@ class StreamingMixin:
         tags: dict[str, str],
         optimization_latency: float,
         pipeline_timing: dict[str, float] | None = None,
-    ) -> StreamingResponse:
+        original_model: str | None = None,
+        health: Any | None = None,
+    ) -> "StreamingResponse | None":
         """Stream response from Bedrock backend with metrics tracking.
 
         Translates Bedrock streaming events to Anthropic SSE format.
+
+        Returns None if the backend immediately errors (before yielding any
+        content), allowing the caller to fall back to the frontier path.
+        When None is returned, ``body["model"]`` is restored to
+        ``original_model`` (if provided) and the circuit breaker is updated.
         """
         from fastapi.responses import StreamingResponse
 
@@ -1335,60 +1342,83 @@ class StreamingMixin:
 
         start_time = time.time()
 
+        # Peek at the first event before committing to streaming. If the
+        # backend immediately fails (exception or error event), signal the
+        # caller to fall back to frontier instead of returning an error SSE
+        # to the client.
+        assert self.anthropic_backend is not None
+        _backend_iter = self.anthropic_backend.stream_message(body, headers).__aiter__()
+        _peeked: list[Any] = []
+        _peek_error: str | None = None
+        try:
+            first = await _backend_iter.__anext__()
+            if first.event_type == "error":
+                _peek_error = str(first.data)
+            else:
+                _peeked.append(first)
+        except StopAsyncIteration:
+            pass
+        except Exception as e:
+            _peek_error = str(e)
+
+        if _peek_error is not None:
+            logger.warning(
+                "[%s] selfhosted stream failed before first event: %s — falling back to frontier",
+                request_id,
+                _peek_error,
+            )
+            if health is not None:
+                health.record_request_failure(500)
+            if original_model is not None:
+                body["model"] = original_model
+            return None
+
         # Mutable state for the generator. Cache fields mirror the
         # native ``_finalize_stream_response`` shape so the PERF log
         # values match between paths (issue #327).
         stream_state: dict[str, Any] = {
             "input_tokens": 0,
             "output_tokens": 0,
-            "ttfb_ms": None,
+            "ttfb_ms": (time.time() - start_time) * 1000,  # TTFB already elapsed during peek
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
         }
 
+        def _process_event_state(event: Any) -> bytes:
+            """Format one backend event as SSE bytes and update stream_state."""
+            if event.event_type == "message_start":
+                msg = event.data.get("message", {})
+                usage = msg.get("usage", {})
+                if "input_tokens" in usage:
+                    stream_state["input_tokens"] = usage["input_tokens"]
+                stream_state["cache_read_input_tokens"] = usage.get(
+                    "cache_read_input_tokens", 0
+                )
+                stream_state["cache_creation_input_tokens"] = usage.get(
+                    "cache_creation_input_tokens", 0
+                )
+                cw_5m, cw_1h = self._extract_anthropic_cache_ttl_metrics(usage)
+                stream_state["cache_creation_ephemeral_5m_input_tokens"] = cw_5m
+                stream_state["cache_creation_ephemeral_1h_input_tokens"] = cw_1h
+            elif event.event_type == "message_delta":
+                usage = event.data.get("usage", {})
+                if "output_tokens" in usage:
+                    stream_state["output_tokens"] = usage["output_tokens"]
+            elif event.event_type == "error":
+                logger.error(f"[{request_id}] Bedrock stream error: {event.data}")
+            if event.raw_sse:
+                return event.raw_sse.encode()
+            return f"event: {event.event_type}\ndata: {json.dumps(event.data)}\n\n".encode()
+
         async def generate():
             try:
-                assert self.anthropic_backend is not None
-
-                async for event in self.anthropic_backend.stream_message(body, headers):
-                    # Record TTFB on first event
-                    if stream_state["ttfb_ms"] is None:
-                        stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
-
-                    # Format as SSE
-                    if event.raw_sse:
-                        yield event.raw_sse.encode()
-                    else:
-                        sse_line = f"event: {event.event_type}\ndata: {json.dumps(event.data)}\n\n"
-                        yield sse_line.encode()
-
-                    # Track usage from message_start event
-                    if event.event_type == "message_start":
-                        msg = event.data.get("message", {})
-                        usage = msg.get("usage", {})
-                        if "input_tokens" in usage:
-                            stream_state["input_tokens"] = usage["input_tokens"]
-                        stream_state["cache_read_input_tokens"] = usage.get(
-                            "cache_read_input_tokens", 0
-                        )
-                        stream_state["cache_creation_input_tokens"] = usage.get(
-                            "cache_creation_input_tokens", 0
-                        )
-                        cw_5m, cw_1h = self._extract_anthropic_cache_ttl_metrics(usage)
-                        stream_state["cache_creation_ephemeral_5m_input_tokens"] = cw_5m
-                        stream_state["cache_creation_ephemeral_1h_input_tokens"] = cw_1h
-
-                    # Track output tokens from message_delta
-                    if event.event_type == "message_delta":
-                        usage = event.data.get("usage", {})
-                        if "output_tokens" in usage:
-                            stream_state["output_tokens"] = usage["output_tokens"]
-
-                    # Handle errors
-                    if event.event_type == "error":
-                        logger.error(f"[{request_id}] Bedrock stream error: {event.data}")
+                # Yield the peeked event first, then consume the rest
+                for event in _peeked:
+                    yield _process_event_state(event)
+                async for event in _backend_iter:
+                    yield _process_event_state(event)
 
             except Exception as e:
                 logger.error(f"[{request_id}] Bedrock streaming error: {e}")
