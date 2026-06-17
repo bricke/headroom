@@ -1,6 +1,6 @@
 # Design: Capability-Aware Backend Routing (Local/Remote ↔ Frontier)
 
-**Status:** Phase 2 complete and committed
+**Status:** Phase 3 complete and committed; streaming fallback and bug fixes applied post-Phase 3
 **Target:** `bricke/headroom` fork — branch `feat/backend-routing`
 **Author:** Matteo Brichese
 **Date:** 2026-06-04 (updated 2026-06-05)
@@ -302,10 +302,13 @@ Handlers (`proxy/handlers/*.py`) ideally need **no change** — they keep callin
 - This alone delivers the main scenario's core value (free company model when
   available, frontier when it is down, throttled, or off-VPN).
 
-**Phase 3 — Complexity routing (1–2 days)**
-- Implement `proxy/backend_decision.py` + heuristic complexity scorer.
-- Wire decision order: override → availability → complexity threshold.
-- Make `threshold`, `prefer` config-driven.
+**Phase 3 — Complexity routing (1–2 days)** ✓ complete (`12e7fc06`)
+- Implemented `proxy/routing_complexity.py` — deterministic 0.0–1.0 scorer (tokens, tools,
+  system prompt, turn depth, structured output). Handles Anthropic, OpenAI, and Gemini formats.
+- `routing_prefer=auto` wired into `decide()`: availability gate runs first, then complexity
+  threshold check.
+- `HEADROOM_ROUTING_COMPLEXITY_THRESHOLD` env var; default 0.5, production value 0.60.
+- 25 unit tests covering scorer and `decide()` auto-mode.
 
 **Phase 4 — Observability & overrides (1 day)**
 - Surface `BackendDecision` (target, reason, score) in telemetry/dashboard and logs.
@@ -559,7 +562,154 @@ Before committing, two issues were cleaned up:
 
 ---
 
-## 11. Open questions / decisions to make
+## 11. Implementation notes (Phase 3 + post-Phase 3 hardening)
+
+### What was built (Phase 3)
+Phase 3 adds the complexity classifier and the `routing_prefer=auto` mode. Commit: `12e7fc06`.
+
+### Files changed
+| File | Change |
+|------|--------|
+| `headroom/proxy/routing_complexity.py` | **New module**: `score_complexity()` + per-format helpers |
+| `headroom/proxy/backend_decision.py` | `decide()` extended with `auto` branch; calls `score_complexity()` |
+| `headroom/proxy/models.py` | New field: `routing_complexity_threshold` (float, default 0.5) |
+| `headroom/cli/proxy.py` | Wires `HEADROOM_ROUTING_COMPLEXITY_THRESHOLD` |
+| `tests/test_routing_complexity.py` | 25 new unit tests for scorer and `decide()` auto-mode |
+
+### Complexity scorer (`routing_complexity.py`)
+A deterministic 0.0–1.0 heuristic scorer. No external dependencies, no I/O — runs in microseconds.
+
+**Signal weights (fixed; sum to 1.0):**
+| Signal | Weight | Normalisation cap |
+|--------|--------|-------------------|
+| Estimated token count (`len(text)//4`) | 0.40 | 8 000 tokens |
+| Tool definitions count | 0.25 | 10 tools |
+| System prompt length (chars) | 0.15 | 2 000 chars |
+| Turn depth (non-system messages) | 0.10 | 20 turns |
+| Structured output requested | 0.10 | boolean |
+
+**Format detection:** body structure is inspected once to pick the right extraction path:
+- `"contents"` key present → Gemini `generateContent` format
+- Otherwise → Anthropic Messages API or OpenAI Chat Completions (same extraction logic)
+
+**Threshold tuning guidance (documented in module):**
+- More capable local model → raise threshold (e.g. 0.7) to keep more requests local
+- Less capable local model → lower threshold (e.g. 0.3) to offload more to frontier
+- The single operator knob is `HEADROOM_ROUTING_COMPLEXITY_THRESHOLD`; weights are fixed
+
+**Observed scores in production (Claude Code sessions on LAN):**
+- Simple greetings / short prompts: 0.005–0.10
+- Full Claude Code sessions (1 400–2 000 tokens, full tool suite): 0.47–0.54
+- Practical threshold for a capable local model: **0.60** — routes all observed Claude Code traffic to local while leaving headroom for genuinely heavy multi-turn sessions
+
+### Decision order in `auto` mode
+1. No backend → `frontier` (unchanged)
+2. Routing disabled → `selfhosted` (legacy path, unchanged)
+3. Circuit open → `frontier` (`reason="selfhosted_circuit_open"`)
+4. `score_complexity(body) >= threshold` → `frontier` (`reason="complexity_above_threshold"`)
+5. Otherwise → `selfhosted` (`reason="complexity_below_threshold"`)
+
+### Configuration (new env var)
+```
+HEADROOM_ROUTING_PREFER=auto                 # enable complexity routing
+HEADROOM_ROUTING_COMPLEXITY_THRESHOLD=0.60   # tune to local model capability
+```
+
+---
+
+## 12. Post-Phase 3 bug fixes and hardening
+
+These changes were discovered during live testing against a real LAN LLM (llama.cpp on dante).
+Commits between `12e7fc06` and `a0aa93f2`.
+
+### Tool format mismatch (`3ddbb674`, `1c797f1f`)
+
+**Problem — client-private fields in tool definitions:**
+The `@ai-sdk/anthropic` client emits an `eager_input_streaming` field inside tool definitions. The Anthropic API (since 2025-04) also requires `type: "custom"` on every tool. Both missing/extra fields caused 422 errors on the frontier path.
+
+**Fix (`3ddbb674`):** `anthropic.py` normalises tool definitions in-place before forwarding: strips unknown private fields and injects `type: "custom"` where absent.
+
+**Problem — Anthropic → OpenAI tool format conversion:**
+Anthropic tools use `{"type": "custom", "input_schema": {...}}`. OpenAI-compatible backends (including llama.cpp) expect `{"type": "function", "function": {"name": ..., "parameters": {...}}}`. Passing the Anthropic format through caused 500s from the selfhosted endpoint.
+
+**Fix (`1c797f1f`):** `AnyLLMBackend` converts each Anthropic tool definition to the OpenAI function-call format before dispatching.
+
+### HTTP status code preservation in `AnyLLMBackend` (`d1a5f495`)
+
+**Problem:** the exception handler in `AnyLLMBackend.stream_message` attempted to extract an HTTP status code by keyword-matching the exception string. The keyword `"model"` (intended to catch 404 "model not found") also matched legitimate 503 "model loading" errors, remapping them to 404 — which is not in the fallback list (`429, 500, 502, 503, 504`), so the fallback silently never triggered.
+
+**Fix:** extract the real HTTP status from the exception object first; fall back to keyword matching only if no numeric code is present.
+
+### Context-overflow fallback (`203c12e7`)
+
+**Problem:** when the selfhosted model rejected a request due to context length (HTTP 400), the handler did not fall back to frontier because 400 was not in the fallback status list.
+
+**Fix:** the non-streaming fallback in `anthropic.py` treats HTTP 400 as a fallback trigger when the response body contains any of the keywords `"context"`, `"token"`, `"length"`, `"exceed"`, `"too long"`, `"too large"`. Non-context 400s (malformed JSON, etc.) are still returned to the client as-is.
+
+### Streaming fallback: peek-before-commit (`0e7a91cc`)
+
+**Problem:** the Phase 2 streaming path had no fallback. Once `_stream_response_bedrock` started iterating the SSE stream, the response was committed. If the selfhosted model errored on the very first event (context overflow, OOM, etc.), the error was surfaced to the client as a broken SSE stream instead of falling through to frontier.
+
+**Design decision:** an answer-grading cascade (run local, judge, then escalate) is impractical for streaming — the stream is already open. The solution is an **upfront peek**: consume exactly one event from the selfhosted async iterator before creating the `StreamingResponse`. If that event is an error or raises an exception, the function returns `None`; the caller falls through to the native frontier path as if selfhosted had never been tried.
+
+**Implementation:**
+```python
+async def _stream_response_bedrock(..., original_model=None, health=None) -> StreamingResponse | None:
+    _backend_iter = self.anthropic_backend.stream_message(body, headers).__aiter__()
+    _peeked: list[Any] = []
+    try:
+        first = await _backend_iter.__anext__()
+        if first.event_type == "error":
+            _peek_error = str(first.data)
+        else:
+            _peeked.append(first)
+    except StopAsyncIteration:
+        pass
+    except Exception as e:
+        _peek_error = str(e)
+
+    if _peek_error is not None:
+        if health is not None:
+            health.record_request_failure(500)
+        if original_model is not None:
+            body["model"] = original_model
+        return None   # caller falls through to frontier
+
+    async def generate():
+        for event in _peeked:       # replay the peeked event
+            yield _process_event_state(event)
+        async for event in _backend_iter:
+            yield _process_event_state(event)
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+```
+
+The call site in `anthropic.py` was changed from `return await _stream_response_bedrock(...)` to:
+```python
+_stream_resp = await self._stream_response_bedrock(..., original_model=_original_model, health=_health)
+if _stream_resp is not None:
+    return _stream_resp
+# None → selfhosted errored before first event; fall through to frontier
+```
+
+### Routing diagnostic logging (`bd7b35c4`, `59bbc9e2`, `a0aa93f2`)
+
+**Problem:** `logger.warning()` calls added for routing diagnostics produced no output in `docker logs`. Root cause: uvicorn's startup calls `logging.config.dictConfig(...)` which **replaces all root-logger handlers** with uvicorn's own. Application loggers that have no handlers of their own silently drop messages even though the effective level is WARNING.
+
+**Fix (`a0aa93f2`):** switched routing diagnostics to `print(..., flush=True)`, which writes directly to stdout and is always captured by `docker logs`.
+
+**Secondary bug (`59bbc9e2`):** `RoutingHealthProber.is_available` is decorated with `@property`. The diagnostic log was calling `_health.is_available()` (with parentheses), which evaluated the property (a `bool`) and then attempted to call it, raising `TypeError: 'bool' object is not callable`.
+
+**Fix:** changed to `_health.is_available` (no parentheses).
+
+**Diagnostic format** (one line per request, to stdout):
+```
+[{request_id}] routing: target={target} reason={reason} score={score:.3f} circuit={open|closed} stream={bool} tokens={n}
+```
+
+---
+
+## 13. Open questions / decisions to make
 1. **Override interface** — header name and/or model-alias convention for forcing a tier.
 2. **Routing granularity** — global, or only when a specific model alias is requested?
 3. **Health-probe cost** — ping-per-request vs cached TTL; what TTL is acceptable.
@@ -573,7 +723,7 @@ Before committing, two issues were cleaned up:
 
 ---
 
-## 12. Risks
+## 14. Risks
 - **Single-backend assumption is load-bearing.** Widening it touches startup and
   the handler dispatch contract; the wrapper approach contains the blast radius but
   must faithfully implement the whole `Backend` ABC (incl. `name`, `close`, model mapping).
@@ -584,10 +734,10 @@ Before committing, two issues were cleaned up:
 
 ---
 
-## 13. PR notes (for when the PR is opened)
+## 15. PR notes (for when the PR is opened)
 
 ### What this PR adds
-Two-phase capability-aware routing that lets a single Headroom instance
+Three-phase capability-aware routing that lets a single Headroom instance
 intelligently split traffic between a **local/self-hosted LLM** and the
 **Anthropic frontier**, with automatic failover.
 
@@ -625,42 +775,51 @@ intelligently split traffic between a **local/self-hosted LLM** and the
 1. **Frontier stays on native Anthropic passthrough.** We never wrap frontier
    traffic in a `Backend` object. This preserves Headroom's prompt-caching and
    prefix-freeze optimisations, which depend on the native `_retry_request` path.
-2. **No fallback for streaming selfhosted.** Once an SSE stream is open there is
-   nowhere to fall back to. Streaming requests to selfhosted return immediately;
-   only non-streaming requests participate in fallback.
+2. **Streaming fallback uses peek-before-commit.** `_stream_response_bedrock` now
+   returns `StreamingResponse | None`. It consumes one event from the selfhosted
+   iterator before creating the response; on error it returns `None` and the caller
+   falls through to frontier. This is the only viable upfront approach — once SSE
+   headers are flushed there is nowhere to redirect.
 3. **`decide()` is pure and dependency-light.** It takes config + optional prober
-   and returns a frozen dataclass. No I/O, no side effects — easy to unit test
-   and slots into Phase 3 (complexity) without structural change.
+   and returns a frozen dataclass. No I/O, no side effects — easy to unit test.
 4. **`RoutingHealthProber` is created in `server.py`** (not in `backend_decision.py`)
    to keep the decision module stateless. The handlers access it via
    `getattr(self, "health_prober", None)` so they are safe in unit-test contexts.
 5. **Health prober lifecycle**: `start()` in `server.startup()`;
    `stop()` in `server.shutdown()` **before** `http_client.aclose()` to avoid
    aiohttp teardown races.
+6. **Use `print(flush=True)` for routing diagnostics, not `logger.warning()`.** uvicorn's
+   `dictConfig` replaces all root-logger handlers at startup; application loggers
+   without their own handlers silently drop messages. `print()` goes directly to stdout.
+7. **Context-overflow (HTTP 400) is treated as a fallback trigger**, not an error.
+   Only when the body matches known overflow keywords; unrelated 400s are returned as-is.
 
 ### Files changed summary
 | File | Change |
 |------|--------|
 | `headroom/proxy/routing_health.py` | New — circuit breaker + prober |
-| `headroom/proxy/backend_decision.py` | Extended `decide()` with health param |
-| `headroom/proxy/models.py` | 9 new `ProxyConfig` fields (5 Phase 1, 4 Phase 2) |
+| `headroom/proxy/routing_complexity.py` | New — heuristic complexity scorer |
+| `headroom/proxy/backend_decision.py` | Extended with health + complexity (`auto` mode) |
+| `headroom/proxy/models.py` | 10 new `ProxyConfig` fields (5 P1, 4 P2, 1 P3) |
 | `headroom/proxy/server.py` | Creates/starts/stops `RoutingHealthProber` |
-| `headroom/cli/proxy.py` | Wires all env vars into `ProxyConfig` |
-| `headroom/proxy/handlers/anthropic.py` | Routing gate + fallback pattern |
-| `headroom/proxy/handlers/openai.py` | Same routing gate + fallback pattern |
+| `headroom/cli/proxy.py` | Wires all env vars including `HEADROOM_ROUTING_COMPLEXITY_THRESHOLD` |
+| `headroom/proxy/handlers/anthropic.py` | Routing gate, fallback, streaming peek, diagnostic log |
+| `headroom/proxy/handlers/streaming.py` | `_stream_response_bedrock` returns `StreamingResponse \| None` |
+| `headroom/proxy/handlers/openai.py` | Routing gate + fallback pattern |
+| `headroom/backends/anyllm.py` | Tool format conversion (Anthropic→OpenAI), status code fix |
 | `docs/design/local-frontier-routing.md` | This document |
 | `tests/test_routing_health.py` | 26 unit tests |
 | `tests/test_routing_decision.py` | 14 unit tests |
+| `tests/test_routing_complexity.py` | 25 unit tests |
 
 ### Test evidence
-- 40 unit tests, all pass.
-- Docker integration: happy path, bad-endpoint fallback, frontier-failure
-  propagation, and OpenAI handler path — all verified manually.
+- 65 unit tests, all pass.
+- Docker integration: happy path, bad-endpoint fallback, context-overflow fallback,
+  frontier-failure propagation, streaming peek fallback, and OpenAI handler path —
+  all verified manually against llama.cpp on dante.
 
 ### What is NOT in this PR (future phases)
-- **Phase 3**: Complexity routing — heuristic scorer sends simple requests to
-  selfhosted, complex ones to frontier.
 - **Phase 4**: Observability — Prometheus metrics for routing decisions,
-  per-request override headers.
+  per-request override headers (`x-headroom-route`), token-savings attribution.
 - **Phase 5**: Hardening + docs — README section, docker-compose example,
   final integration tests.
