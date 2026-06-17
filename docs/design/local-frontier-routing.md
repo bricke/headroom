@@ -707,6 +707,16 @@ if _stream_resp is not None:
 [{request_id}] routing: target={target} reason={reason} score={score:.3f} circuit={open|closed} stream={bool} tokens={n}
 ```
 
+### Qwen3 thinking mode (observed 2026-06-17)
+
+Tested against a company-hosted Qwen3 endpoint with thinking mode enabled. Key observations:
+
+- Routing worked correctly — requests routed to selfhosted as expected.
+- With `max_tokens` ≤ 512, responses came back with `content: []` and `output_tokens` equal to the full budget. The model consumed all tokens on internal reasoning (`<think>...</think>`) and had nothing left for the visible reply.
+- With `max_tokens: 3000`, the model finished thinking and produced a complete, coherent response (~115 visible tokens after ~2885 thinking tokens).
+
+**Decision:** Headroom will not attempt to disable or suppress thinking mode. If a company endpoint has thinking enabled, that is an intentional configuration choice. The implication for callers is that `max_tokens` must be set high enough to accommodate the thinking budget plus the expected reply. This is a **client configuration concern**, not a proxy concern. Agents that use low `max_tokens` defaults (e.g. Claude Code's short-message defaults) may receive empty responses when routed to a thinking-enabled selfhosted model.
+
 ---
 
 ## 13. Open questions / decisions to make
