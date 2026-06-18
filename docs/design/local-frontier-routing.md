@@ -715,7 +715,9 @@ Tested against a company-hosted Qwen3 endpoint with thinking mode enabled. Key o
 - With `max_tokens` ≤ 512, responses came back with `content: []` and `output_tokens` equal to the full budget. The model consumed all tokens on internal reasoning (`<think>...</think>`) and had nothing left for the visible reply.
 - With `max_tokens: 3000`, the model finished thinking and produced a complete, coherent response (~115 visible tokens after ~2885 thinking tokens).
 
-**Decision:** Headroom will not attempt to disable or suppress thinking mode. If a company endpoint has thinking enabled, that is an intentional configuration choice. The implication for callers is that `max_tokens` must be set high enough to accommodate the thinking budget plus the expected reply. This is a **client configuration concern**, not a proxy concern. Agents that use low `max_tokens` defaults (e.g. Claude Code's short-message defaults) may receive empty responses when routed to a thinking-enabled selfhosted model.
+**Decision:** Headroom will not attempt to disable or suppress thinking mode.
+
+**OpenCode retry loop:** OpenCode has a known bug where it retries failed/empty responses indefinitely with no backoff or max limit (issues #30510, #12234). An empty Qwen3 response (thinking tokens exhausted) triggers this loop, rapidly growing the context and spilling over into frontier. Workaround: press Escape/Ctrl+C in OpenCode as soon as looping is detected. This is an OpenCode bug, not a Headroom concern. If a company endpoint has thinking enabled, that is an intentional configuration choice. The implication for callers is that `max_tokens` must be set high enough to accommodate the thinking budget plus the expected reply. This is a **client configuration concern**, not a proxy concern. Agents that use low `max_tokens` defaults (e.g. Claude Code's short-message defaults) may receive empty responses when routed to a thinking-enabled selfhosted model.
 
 ---
 
