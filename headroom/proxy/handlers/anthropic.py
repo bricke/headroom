@@ -1691,11 +1691,26 @@ class AnthropicHandlerMixin:
                 body,
                 _health,
             )
+            _messages = body.get("messages", [])
+            _last_user = next(
+                (m for m in reversed(_messages) if m.get("role") == "user"), None
+            )
+            _prompt_text = ""
+            if _last_user:
+                _content = _last_user.get("content", "")
+                if isinstance(_content, str):
+                    _prompt_text = _content
+                elif isinstance(_content, list):
+                    _prompt_text = " ".join(
+                        b.get("text", "") for b in _content if isinstance(b, dict) and b.get("type") == "text"
+                    )
+            _prompt_preview = (_prompt_text[:120] + "…") if len(_prompt_text) > 120 else _prompt_text
             print(
                 f"[{request_id}] routing: target={_route.target} reason={_route.reason}"
                 f" score={f'{_route.complexity_score:.3f}' if _route.complexity_score is not None else 'n/a'}"
                 f" circuit={'open' if (_health and not _health.is_available) else 'closed'}"
-                f" stream={stream} tokens={original_tokens}",
+                f" stream={stream} tokens={original_tokens}"
+                f" prompt={_prompt_preview!r}",
                 flush=True,
             )
             if _route.use_selfhosted and _route.routing_enabled:

@@ -1935,6 +1935,28 @@ class OpenAIHandlerMixin:
             body,
             _health,
         )
+        _oa_messages = body.get("messages", [])
+        _oa_last_user = next(
+            (m for m in reversed(_oa_messages) if m.get("role") == "user"), None
+        )
+        _oa_prompt_text = ""
+        if _oa_last_user:
+            _oa_content = _oa_last_user.get("content", "")
+            if isinstance(_oa_content, str):
+                _oa_prompt_text = _oa_content
+            elif isinstance(_oa_content, list):
+                _oa_prompt_text = " ".join(
+                    b.get("text", "") for b in _oa_content if isinstance(b, dict) and b.get("type") == "text"
+                )
+        _oa_prompt_preview = (_oa_prompt_text[:120] + "…") if len(_oa_prompt_text) > 120 else _oa_prompt_text
+        print(
+            f"[{request_id}] routing: target={_route.target} reason={_route.reason}"
+            f" score={f'{_route.complexity_score:.3f}' if _route.complexity_score is not None else 'n/a'}"
+            f" circuit={'open' if (_health and not _health.is_available) else 'closed'}"
+            f" stream={stream} tokens={original_tokens}"
+            f" prompt={_oa_prompt_preview!r}",
+            flush=True,
+        )
         if _route.use_selfhosted and _route.routing_enabled:
             apply_selfhosted_model(self.config, body)
         if _route.use_selfhosted:
