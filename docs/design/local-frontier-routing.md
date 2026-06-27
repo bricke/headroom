@@ -737,6 +737,16 @@ Tested against a company-hosted Qwen3 endpoint with thinking mode enabled. Key o
 
 **OpenCode retry loop:** OpenCode has a known bug where it retries failed/empty responses indefinitely with no backoff or max limit (issues #30510, #12234). An empty Qwen3 response (thinking tokens exhausted) triggers this loop, rapidly growing the context and spilling over into frontier. Workaround: press Escape/Ctrl+C in OpenCode as soon as looping is detected. This is an OpenCode bug, not a Headroom concern. If a company endpoint has thinking enabled, that is an intentional configuration choice. The implication for callers is that `max_tokens` must be set high enough to accommodate the thinking budget plus the expected reply. This is a **client configuration concern**, not a proxy concern. Agents that use low `max_tokens` defaults (e.g. Claude Code's short-message defaults) may receive empty responses when routed to a thinking-enabled selfhosted model.
 
+### Claude Code client incompatibility (observed 2026-06-26)
+
+Claude Code is **not compatible** with capability-aware routing to a non-Claude selfhosted model. Two structural issues were identified by inspecting live `routing_body` logs:
+
+1. **Quota check requests.** On startup Claude Code sends a synthetic request `{"content":"quota","max_tokens":1}` to verify the API key has quota. This routes to selfhosted (score ≈ 0.001) and the selfhosted model receives a nonsensical request it was not designed to handle.
+
+2. **`<system-reminder>` injections as user content.** Claude Code injects framework metadata blocks (`<system-reminder>`, `<session>`, agent-type descriptions, skill listings, etc.) as `{"role":"user","content":[{"type":"text","text":"<system-reminder>..."}]}` messages. These blocks contain high-complexity keywords (`implement`, `build`, `create`, `design`) sourced from agent descriptions, not from the user's actual intent. A trivial user turn ("what can you do?") therefore scores 0.733 and routes to frontier — the opposite of the desired outcome. The blocks are also semantically opaque to any non-Claude model.
+
+**Decision:** use a standard agent client (one that sends system prompt + messages + tools without injecting framework-specific meta-blocks) for sessions where selfhosted routing is intended. Claude Code sessions should be treated as frontier-only or kept on a Headroom instance with `routing_prefer=frontier`.
+
 ---
 
 ## 13. Open questions / decisions to make
