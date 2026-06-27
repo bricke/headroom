@@ -564,43 +564,58 @@ Before committing, two issues were cleaned up:
 
 ## 11. Implementation notes (Phase 3 + post-Phase 3 hardening)
 
-### What was built (Phase 3)
+### What was built (Phase 3 — initial scorer)
 Phase 3 adds the complexity classifier and the `routing_prefer=auto` mode. Commit: `12e7fc06`.
 
-### Files changed
-| File | Change |
-|------|--------|
-| `headroom/proxy/routing_complexity.py` | **New module**: `score_complexity()` + per-format helpers |
-| `headroom/proxy/backend_decision.py` | `decide()` extended with `auto` branch; calls `score_complexity()` |
-| `headroom/proxy/models.py` | New field: `routing_complexity_threshold` (float, default 0.5) |
-| `headroom/cli/proxy.py` | Wires `HEADROOM_ROUTING_COMPLEXITY_THRESHOLD` |
-| `tests/test_routing_complexity.py` | 25 new unit tests for scorer and `decide()` auto-mode |
+Initial scorer signals (cumulative context — replaced in Phase 3.1, see below):
 
-### Complexity scorer (`routing_complexity.py`)
-A deterministic 0.0–1.0 heuristic scorer. No external dependencies, no I/O — runs in microseconds.
-
-**Signal weights (fixed; sum to 1.0):**
-| Signal | Weight | Normalisation cap |
-|--------|--------|-------------------|
-| Estimated token count (`len(text)//4`) | 0.40 | 8 000 tokens |
+| Signal | Weight | Cap |
+|--------|--------|-----|
+| Estimated token count of all messages | 0.40 | 8 000 tokens |
 | Tool definitions count | 0.25 | 10 tools |
 | System prompt length (chars) | 0.15 | 2 000 chars |
 | Turn depth (non-system messages) | 0.10 | 20 turns |
 | Structured output requested | 0.10 | boolean |
 
-**Format detection:** body structure is inspected once to pick the right extraction path:
-- `"contents"` key present → Gemini `generateContent` format
-- Otherwise → Anthropic Messages API or OpenAI Chat Completions (same extraction logic)
+**Problem discovered in production:** with a coding agent (Claude Code / OpenCode), tool count and system prompt contribute ~0.40 at session start and token count climbs monotonically. The threshold became "how many turns before we switch to frontier" — a "thanks!" at turn 20 scored the same as "implement OAuth2" at turn 1.
 
-**Threshold tuning guidance (documented in module):**
-- More capable local model → raise threshold (e.g. 0.7) to keep more requests local
-- Less capable local model → lower threshold (e.g. 0.3) to offload more to frontier
-- The single operator knob is `HEADROOM_ROUTING_COMPLEXITY_THRESHOLD`; weights are fixed
+---
 
-**Observed scores in production (Claude Code sessions on LAN):**
-- Simple greetings / short prompts: 0.005–0.10
-- Full Claude Code sessions (1 400–2 000 tokens, full tool suite): 0.47–0.54
-- Practical threshold for a capable local model: **0.60** — routes all observed Claude Code traffic to local while leaving headroom for genuinely heavy multi-turn sessions
+### Phase 3.1 — Content-aware scorer (commit `db9be89`)
+
+Replaced cumulative token/turn signals with content signals derived from the **last user message only**. The same message now scores identically at turn 1 and turn 20.
+
+**New signal structure (weights sum to 1.0):**
+
+Baseline (fixed per-request context):
+| Signal | Weight | Cap |
+|--------|--------|-----|
+| Tool definitions count | 0.20 | 10 tools |
+| System prompt length (chars) | 0.10 | 2 000 chars |
+| Structured output requested | 0.10 | boolean |
+
+Content (last user message only):
+| Signal | Weight | Cap |
+|--------|--------|-----|
+| Message character length | 0.15 | 1 500 chars |
+| Code block presence (` ``` ` count) | 0.10 | 3 occurrences |
+| Task count (bullets + numbered + additive conjunctions) | 0.15 | 5 |
+| Complexity keywords (`implement`, `refactor`, `design`…) | 0.10 | 4 matches |
+| Multi-step markers (`step-by-step`, `then`, `after that`…) | 0.10 | 3 matches |
+
+**Keyword logic:** if a low-complexity phrase (`hi`, `thanks`, `ok`…) matches **and** no high-complexity keyword matches → keyword score = 0.0. This ensures greetings score zero even when many tools are loaded.
+
+**Key properties:**
+- No external dependencies — stdlib `re` only
+- `score_complexity(body)` signature unchanged; handles Anthropic, OpenAI, Gemini formats
+- "thanks!" + 10 tools + structured output = 0.30 (baseline only) → stays on selfhosted at threshold 0.60
+- "implement OAuth2 with JWT" on turn 1 = ~0.45 content + baseline → crosses frontier threshold
+
+**Files changed:**
+| File | Change |
+|------|--------|
+| `headroom/proxy/routing_complexity.py` | Full rewrite: new weights, regex patterns, `_score_last_message()`, `_last_user_text_*()` helpers |
+| `tests/test_routing_complexity.py` | Removed `test_score_increases_with_turn_count`; added `TestScoreLastMessage` (11 tests) + `TestContentVsContext` regression class (2 tests); 37 tests total |
 
 ### Decision order in `auto` mode
 1. No backend → `frontier` (unchanged)
@@ -609,11 +624,14 @@ A deterministic 0.0–1.0 heuristic scorer. No external dependencies, no I/O —
 4. `score_complexity(body) >= threshold` → `frontier` (`reason="complexity_above_threshold"`)
 5. Otherwise → `selfhosted` (`reason="complexity_below_threshold"`)
 
-### Configuration (new env var)
+### Configuration
 ```
 HEADROOM_ROUTING_PREFER=auto                 # enable complexity routing
 HEADROOM_ROUTING_COMPLEXITY_THRESHOLD=0.60   # tune to local model capability
 ```
+
+### Future: LLM-based router
+A small (1–3B) model classifier could replace the heuristic scorer for higher accuracy — understanding intent rather than matching keywords and lengths. [RouteLLM](https://github.com/lm-sys/routellm) (LMSYS) provides pre-trained open-source classifiers designed for exactly this task. The tradeoff is added latency per request and an additional inference process on the LAN. The heuristic scorer is good enough for now; the `score_complexity()` interface is designed to accommodate a drop-in replacement.
 
 ---
 
@@ -732,6 +750,10 @@ Tested against a company-hosted Qwen3 endpoint with thinking mode enabled. Key o
    the external frontier. This would become a hard routing *constraint* layered on
    top of cost optimization. Out of scope now; flagged so the decision module's
    shape can accommodate it.
+6. **LLM-based router** — replace heuristic with a small classifier (e.g. RouteLLM) for
+   better accuracy. Deferred: heuristic is good enough for current use. See §11 for details.
+7. **Prompt logging** — the `[LOG]` commit (`9eacfd3`) adds per-request prompt preview to
+   stdout. Revert when debugging is complete (`git revert 9eacfd3`).
 
 ---
 
