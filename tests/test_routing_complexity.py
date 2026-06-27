@@ -2,7 +2,9 @@
 
 Covers:
 - score_complexity(): Anthropic, OpenAI, and Gemini format bodies
-- Individual signal contributions
+- Individual signal contributions (baseline + content)
+- _score_last_message(): content-signal unit tests
+- Regression: same message scores identically regardless of turn count
 - decide() with routing_prefer="auto"
 - Circuit open overrides complexity routing
 - Threshold edge cases
@@ -15,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from headroom.proxy.backend_decision import BackendDecision, decide
-from headroom.proxy.routing_complexity import score_complexity
+from headroom.proxy.routing_complexity import _score_last_message, score_complexity
 from headroom.proxy.routing_health import RoutingHealthProber
 
 
@@ -91,6 +93,103 @@ def _gemini_body(
 
 
 # ---------------------------------------------------------------------------
+# _score_last_message — content signal unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestScoreLastMessage:
+    def test_empty_text_scores_zero(self) -> None:
+        assert _score_last_message("") == 0.0
+        assert _score_last_message("   ") == 0.0
+
+    def test_greeting_scores_near_zero(self) -> None:
+        for greeting in ("hi", "thanks", "thank you", "great", "ok", "sounds good"):
+            score = _score_last_message(greeting)
+            assert score < 0.05, f"expected low score for {greeting!r}, got {score}"
+
+    def test_implement_keyword_scores_above_zero(self) -> None:
+        score = _score_last_message("implement a login page")
+        assert score > 0.0
+
+    def test_code_block_raises_score(self) -> None:
+        without = _score_last_message("fix this")
+        with_code = _score_last_message("fix this\n```python\npass\n```")
+        assert with_code > without
+
+    def test_multiple_bullets_raises_score(self) -> None:
+        plain = _score_last_message("do something")
+        bulleted = _score_last_message(
+            "do something\n- task one\n- task two\n- task three"
+        )
+        assert bulleted > plain
+
+    def test_numbered_list_raises_score(self) -> None:
+        plain = _score_last_message("do something")
+        numbered = _score_last_message(
+            "do something\n1. first step\n2. second step\n3. third step"
+        )
+        assert numbered > plain
+
+    def test_multistep_markers_raise_score(self) -> None:
+        plain = _score_last_message("implement a feature")
+        multistep = _score_last_message(
+            "implement a feature step-by-step, then write tests, after that add docs"
+        )
+        assert multistep > plain
+
+    def test_long_message_raises_length_score(self) -> None:
+        short = _score_last_message("hi")
+        long = _score_last_message("x" * 1600)  # above _CAP_MSG_LENGTH of 1500
+        assert long > short
+
+    def test_low_kw_with_high_kw_not_zeroed(self) -> None:
+        # "can you implement" has both a low-kw match and a high-kw match.
+        # High-kw presence should prevent the zero override.
+        score = _score_last_message("can you implement a caching layer?")
+        assert score > 0.0
+
+    def test_combined_complex_request_scores_high(self) -> None:
+        text = (
+            "Implement a full OAuth2 authentication system with JWT refresh tokens.\n"
+            "- Add login and logout endpoints\n"
+            "- Integrate with the existing user database\n"
+            "- Write unit tests for each endpoint\n"
+            "```python\n# example skeleton\npass\n```\n"
+            "Do this step-by-step, then update the docs."
+        )
+        score = _score_last_message(text)
+        assert score > 0.25
+
+    def test_score_bounded_0_1(self) -> None:
+        score = _score_last_message("x" * 100_000 + " implement " * 100)
+        assert 0.0 <= score <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Regression: content vs context length
+# ---------------------------------------------------------------------------
+
+
+class TestContentVsContext:
+    def test_same_message_same_score_regardless_of_turn_count(self) -> None:
+        """Core regression: 'implement X' should score the same at turn 1 and turn 20."""
+        msg = "implement a caching layer"
+        score_turn_1 = score_complexity(_anthropic_body(content=msg, turns=1))
+        score_turn_20 = score_complexity(_anthropic_body(content=msg, turns=20))
+        assert score_turn_1 == score_turn_20
+
+    def test_greeting_at_high_tool_count_scores_below_threshold(self) -> None:
+        """'thanks!' with 10 tools + structured output should still be below 0.5.
+
+        Baseline max: tools=0.20 + structured=0.10 = 0.30. Content for 'thanks!' = 0.0.
+        Total = 0.30 < 0.5 threshold → routes selfhosted.
+        """
+        body = _anthropic_body(content="thanks!", tools=10, structured=True)
+        score = score_complexity(body)
+        assert score < 0.5
+
+
+# ---------------------------------------------------------------------------
 # score_complexity — Anthropic/OpenAI format
 # ---------------------------------------------------------------------------
 
@@ -102,7 +201,7 @@ class TestScoreComplexityAnthropicOpenAI:
 
     def test_score_increases_with_message_length(self) -> None:
         short = score_complexity(_anthropic_body("hi"))
-        long = score_complexity(_anthropic_body("x" * 10_000))
+        long = score_complexity(_anthropic_body("x" * 1600))  # above 1500 cap
         assert long > short
 
     def test_score_increases_with_tool_count(self) -> None:
@@ -114,11 +213,6 @@ class TestScoreComplexityAnthropicOpenAI:
         no_sys = score_complexity(_anthropic_body(system=""))
         long_sys = score_complexity(_anthropic_body(system="x" * 3000))
         assert long_sys > no_sys
-
-    def test_score_increases_with_turn_count(self) -> None:
-        one_turn = score_complexity(_anthropic_body(turns=1))
-        many_turns = score_complexity(_anthropic_body(turns=20))
-        assert many_turns > one_turn
 
     def test_structured_output_adds_to_score(self) -> None:
         plain = score_complexity(_anthropic_body())
@@ -171,7 +265,7 @@ class TestScoreComplexityGemini:
 
     def test_gemini_long_content_scores_higher(self) -> None:
         short = score_complexity(_gemini_body("hi"))
-        long = score_complexity(_gemini_body("x" * 10_000))
+        long = score_complexity(_gemini_body("x" * 2000))  # above 1500 cap
         assert long > short
 
     def test_gemini_system_instruction_counted(self) -> None:
@@ -225,9 +319,9 @@ class TestDecideAuto:
         assert isinstance(decision.complexity_score, float)
 
     def test_circuit_open_routes_to_frontier_regardless_of_complexity(self) -> None:
-        cfg = make_config(threshold=0.9)  # high threshold → would selfhost simple request
+        cfg = make_config(threshold=0.9)
         prober = make_prober(available=False)
-        body = _anthropic_body("hi")  # trivially simple
+        body = _anthropic_body("hi")
         decision = decide(cfg, make_backend(), body, prober)
         assert decision.target == "frontier"
         assert decision.reason == "selfhosted_circuit_open"
@@ -252,7 +346,6 @@ class TestDecideAuto:
         assert decision.target == "selfhosted"
 
     def test_threshold_boundary_at_score(self) -> None:
-        # A request with score exactly at threshold should route to frontier (>=).
         cfg = make_config(threshold=0.0)
         body = _anthropic_body("hi")
         decision = decide(cfg, make_backend(), body)
