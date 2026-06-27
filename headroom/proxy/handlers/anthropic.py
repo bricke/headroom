@@ -1713,6 +1713,10 @@ class AnthropicHandlerMixin:
                 f" prompt={_prompt_preview!r}",
                 flush=True,
             )
+            print(
+                f"[{request_id}] routing_body: {json.dumps(body, separators=(',', ':'), default=str)}",
+                flush=True,
+            )
             if _route.use_selfhosted and _route.routing_enabled:
                 apply_selfhosted_model(self.config, body)
             if _route.use_selfhosted:
